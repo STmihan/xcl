@@ -55,7 +55,9 @@ pub mod dxc;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
+pub mod scc_liveness;
 pub mod x64_masks;
+pub mod predication;
 pub mod pso;
 pub use emit::mesh_passthrough;
 pub mod runner;
@@ -493,13 +495,29 @@ pub struct Options {
     /// every access from the high address bits
     pub mem_windows: u32,
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
-    /// always the guarded block chain)
+    /// always the guarded block chain) and its skip guards do not outweigh the program
+    /// (`GUARDS_OUTWEIGH_THE_CODE`)
     pub structured: bool,
+    /// a `// pc: disassembly` line before every instruction's HLSL (true, or `XCL_RECOMP_COMMENTS`):
+    /// for reading a dump – a third of the text of a large program, nothing in its DXIL
+    pub source_comments: bool,
+    /// which VGPR writes keep their EXEC predication (`predication`; `EveryWrite` also with
+    /// `XCL_RECOMP_PREDICATE_EVERY_WRITE` set)
+    pub lane_predication: LanePredication,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanePredication {
+    /// `v = select(lane active, value, v)` for every VALU result
+    EveryWrite,
+    /// compute programs: no select where the mask is full or the lanes outside it never read
+    /// the register again
+    WhereObservable,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true, source_comments: false, lane_predication: LanePredication::WhereObservable }
     }
 }
 
@@ -536,7 +554,19 @@ struct Ctx<'a> {
     edges: &'a [(u64, u64)],
     /// `structurable_to` results: (lo, hi, exit) → targets leaving the range
     memo: std::cell::RefCell<std::collections::HashMap<MemoKey, Option<BTreeSet<u64>>>>,
+    /// bytes of the `if (!(skip … || skip …)) {` lines `emit_structured` wrote
+    guard_bytes: std::cell::Cell<usize>,
 }
+
+/// A structured program whose skip guards are more than this share of its code (1 / N) is emitted
+/// as the guarded block chain instead. Every item after a forward jump out of its level is under
+/// `if (!(skip_a || skip_b || …))` with one flag per pending target, so a program with thousands
+/// of crossing jumps gets guards quadratic in their number: one compute program of a retail pack
+/// (76 696 instructions, 3 861 flags) was 111 MB of HLSL, 92 % of it guards, against 4.8 MB as
+/// the block chain – and DXC 1.9 went past 32 GB of memory on it within half a minute at -O0 and
+/// at -O1 alike. The next largest share in that pack's 26 698 programs is 5.6 %
+/// (docs/code/recompiler-hlsl-size.md).
+const GUARDS_OUTWEIGH_THE_CODE: usize = 2;
 
 /// How a block ends (from its last instruction).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -603,6 +633,14 @@ impl Conts {
         self.inner == Some(t) || self.outer.contains(&t)
     }
 }
+
+/// Environment switch for `Options::source_comments` (a debug override: `pso::cache_allowed`).
+pub(super) const SOURCE_COMMENTS_ENV: &str = "XCL_RECOMP_COMMENTS";
+/// Environment switch that keeps every SCC write (`scc_liveness`; a debug override like the one
+/// above).
+pub(super) const ALL_SCC_ENV: &str = "XCL_RECOMP_ALL_SCC";
+/// Environment switch for `LanePredication::EveryWrite` (a debug override like the ones above).
+pub(super) const PREDICATE_EVERY_WRITE_ENV: &str = "XCL_RECOMP_PREDICATE_EVERY_WRITE";
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
 /// the prelude: 65 536) – console code that loops on what XCL passed it wrong (an address, a
@@ -949,7 +987,8 @@ fn emit_structured(
     blocks: &mut usize,
     flags: &mut BTreeSet<u64>,
 ) -> BTreeSet<u64> {
-    let pad = "    ".repeat(depth);
+    let step = emit::INDENT;
+    let pad = step.repeat(depth);
     let mut pending: BTreeSet<u64> = incoming.clone();
     let none = BTreeSet::new();
     // flags of the open `if (!(skip …)) {` around the following items
@@ -979,28 +1018,30 @@ fn emit_structured(
             }
             if !pending.is_empty() {
                 let cond: Vec<String> = pending.iter().map(|&t| skip_flag(t)).collect();
-                body.push_str(&format!("{pad}if (!({})) {{\n", cond.join(" || ")));
+                let opening = format!("{pad}if (!({})) {{\n", cond.join(" || "));
+                c.guard_bytes.set(c.guard_bytes.get() + opening.len());
+                body.push_str(&opening);
                 guard = Some(pending.clone());
             }
         }
         let d = depth + guard.is_some() as usize;
-        let ipad = "    ".repeat(d);
+        let ipad = emit::INDENT.repeat(d);
         if resolved {
             body.push_str(&format!("{ipad}{} = false;\n", skip_flag(s)));
         }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
-                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {LOOP_GUARD}\n"));
+                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}{step}{LOOP_GUARD}\n"));
                 let (lcont, lin) = if entry.is_none() { (cont.enter(Some(a)), &inner) } else { (cont.enter(None), &none) };
                 let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, &lcont, lin, d + 1, blocks, flags);
                 for &t in &r {
                     if t == latch && latch != b {
-                        body.push_str(&format!("{ipad}    {} = false;\n", skip_flag(t)));
+                        body.push_str(&format!("{ipad}{step}{} = false;\n", skip_flag(t)));
                     } else if t == a {
                         // `continue` from a loop inside this one
-                        body.push_str(&format!("{ipad}    if ({0}) {{ {0} = false; continue; }}\n", skip_flag(t)));
+                        body.push_str(&format!("{ipad}{step}if ({0}) {{ {0} = false; continue; }}\n", skip_flag(t)));
                     } else {
-                        body.push_str(&format!("{ipad}    if ({}) break;\n", skip_flag(t)));
+                        body.push_str(&format!("{ipad}{step}if ({}) break;\n", skip_flag(t)));
                     }
                 }
                 if latch != b {
@@ -1009,15 +1050,15 @@ fn emit_structured(
                 r.remove(&a);
                 let latched = if latch == b { emit::Flow::Next } else { emit_block(c, em, body, latch, b, d + 1, blocks) };
                 match latched {
-                    emit::Flow::Cond(cond, _) => body.push_str(&format!("{ipad}    if (!({cond})) break;\n")),
+                    emit::Flow::Cond(cond, _) => body.push_str(&format!("{ipad}{step}if (!({cond})) break;\n")),
                     // unconditional back edge: the loop is left through the skip flags' breaks
                     emit::Flow::Jump(_) | emit::Flow::JumpExpr(_) => {}
-                    _ => body.push_str(&format!("{ipad}    break;\n")),
+                    _ => body.push_str(&format!("{ipad}{step}break;\n")),
                 }
                 if let Some(u) = entry {
                     // rotated: the head after the latch, falling into the next iteration
                     for t in emit_structured(c, em, body, a, u, None, nest + 1, &cont.enter(None), &none, d + 1, blocks, flags) {
-                        body.push_str(&format!("{ipad}    {} = false;\n", skip_flag(t)));
+                        body.push_str(&format!("{ipad}{step}{} = false;\n", skip_flag(t)));
                     }
                 }
                 body.push_str(&format!("{ipad}}}\n"));
@@ -1102,13 +1143,14 @@ fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
 
 /// Emit the blocks starting in [lo, hi) at nesting `depth`; loop ranges become `while`.
 fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, depth: usize, blocks: &mut usize, flags: &mut BTreeSet<u64>) {
-    let pad = "    ".repeat(depth);
+    let step = emit::INDENT;
+    let pad = step.repeat(depth);
     let mut i = c.leaders.partition_point(|&l| l < lo);
     while i < c.leaders.len() && c.leaders[i] < hi {
         let start = c.leaders[i];
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
-            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {LOOP_GUARD}\n"));
+            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}{step}{LOOP_GUARD}\n"));
             emit_range(c, em, body, a, b, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < b);
@@ -1118,10 +1160,10 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         if let Some(x) = structured_span(c, i, hi) {
             body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
             for t in emit_structured(c, em, body, start, x, None, 0, &Conts::default(), &BTreeSet::new(), depth + 1, blocks, flags) {
-                body.push_str(&format!("{pad}    {} = false;\n", skip_flag(t)));
+                body.push_str(&format!("{pad}{step}{} = false;\n", skip_flag(t)));
             }
             let next = if x == u64::MAX || !c.starts.contains(&x) { "0xFFFFFFFFu".to_string() } else { format!("{x}u") };
-            body.push_str(&format!("{pad}    pc = {next};\n{pad}}}\n"));
+            body.push_str(&format!("{pad}{step}pc = {next};\n{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < x);
             continue;
         }
@@ -1146,7 +1188,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
             emit::Flow::Cond(cond, t) => format!("pc = ({cond}) ? {t}u : {fallthrough};"),
             emit::Flow::End => "pc = 0xFFFFFFFFu;".to_string(),
         };
-        body.push_str(&format!("{pad}    {tail}\n{pad}}}\n"));
+        body.push_str(&format!("{pad}{step}{tail}\n{pad}}}\n"));
         *blocks += 1;
         i += 1;
     }
@@ -1394,19 +1436,70 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             leaders.insert(next);
         }
     }
-    let mut em = emit::Em::new(opt.clone());
-    em.configure_round_modes(&insts, branches == 0);
-    em.static_ss = constant_samplers(&insts, &leaders);
+    let traced = emit_program(&insts, opt, &starts, &leaders, branches, Predication::Traced);
+    // the form is chosen once, from the first emission: the passes after it keep it
+    let block_chain = Options { structured: false, ..opt.clone() };
+    let (opt, traced) = if traced.guards_outweigh_the_code {
+        (&block_chain, emit_program(&insts, &block_chain, &starts, &leaders, branches, Predication::Traced))
+    } else {
+        (opt, traced)
+    };
+    let planned = match traced.em.lane_trace.as_ref().map(|trace| predication::plan(&insts, opt.wave64, trace)) {
+        Some(plan) if !plan.is_empty() => emit_program(&insts, opt, &starts, &leaders, branches, Predication::Planned(plan)),
+        _ => traced,
+    };
+    let Emitted { em, body, blocks, .. } = planned;
+    let hlsl = em.finish(&body);
+    let static_samplers = em.static_used.clone();
+    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+}
+
+enum Predication {
+    Traced,
+    Planned(predication::Plan),
+}
+
+struct Emitted {
+    em: emit::Em,
+    body: String,
+    blocks: usize,
+    /// structured, and more guard than program (`GUARDS_OUTWEIGH_THE_CODE`)
+    guards_outweigh_the_code: bool,
+}
+
+fn drops_unobservable_predication(opt: &Options) -> bool {
+    matches!(opt.mode, Mode::Compute(_)) && opt.lane_predication == LanePredication::WhereObservable && std::env::var_os(PREDICATE_EVERY_WRITE_ENV).is_none()
+}
+
+fn emit_program(insts: &[Decoded], opt: &Options, starts: &BTreeSet<u64>, leaders: &BTreeSet<u64>, branches: usize, predication: Predication) -> Emitted {
+    let gs_jump = match &opt.mode {
+        Mode::Geometry(g) => Some(g.gs_start.filter(|&s| s > 0)),
+        _ => None,
+    };
+    let mut em = emit::Em::new(Options { source_comments: opt.source_comments || std::env::var_os(SOURCE_COMMENTS_ENV).is_some(), ..opt.clone() });
+    match predication {
+        Predication::Traced if drops_unobservable_predication(opt) => em.lane_trace = Some(Default::default()),
+        Predication::Traced => {}
+        Predication::Planned(plan) => em.predication = plan,
+    }
+    em.configure_round_modes(insts, branches == 0);
+    em.static_ss = constant_samplers(insts, leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is)
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        em.x64_whole_live = x64_masks::by_pc(insts, matches!(opt.mode, Mode::Kernel));
+    }
+    // SCC writes nothing reads are left out of kernel / compute / mesh programs (the modes
+    // `x64_masks` covers; VS / PS / GS are left as they are); `XCL_RECOMP_ALL_SCC=1` keeps
+    // them all
+    if matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os(ALL_SCC_ENV).is_none() {
+        em.dead_scc_writes = scc_liveness::dead_writes(insts, matches!(opt.mode, Mode::Kernel));
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
     // program with a read to change gets the form
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
-        let a = upper_lanes::analyze(&insts);
+        let a = upper_lanes::analyze(insts);
         if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
             em.upper = Some(a);
         }
@@ -1420,10 +1513,11 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         .max()
         .unwrap_or(0);
     if let Mode::Pixel(ps) = &opt.mode {
-        em.ps_modes = emit::ps_attr_modes(&insts, ps.input_ena);
+        em.ps_modes = emit::ps_attr_modes(insts, ps.input_ena);
     }
     let mut body = String::new();
     let mut blocks = 0usize;
+    let mut guards_outweigh_the_code = false;
     if branches == 0 {
         // straight line: stop at the first s_endpgm (the rest is unreachable)
         em.indent = 1;
@@ -1441,18 +1535,19 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // (`while (pc in range)`); ranges are merged until they nest. Same semantics as a
         // dispatcher loop over all blocks, but DXC sees an acyclic graph almost everywhere
         // (optimising one big dispatcher loop took minutes on large retail programs).
-        let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
-        let loops = loop_ranges(&insts);
+        let leaders: Vec<u64> = leaders.iter().copied().filter(|l| starts.contains(l)).collect();
+        let loops = loop_ranges(insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
+        let ctx = Ctx { insts, starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default(), guard_bytes: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
         let nested = nested_loop_ranges(&insts);
-        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, memo: Default::default() };
+        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, memo: Default::default(), guard_bytes: Default::default() };
         if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&sctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
             emit_structured(&sctx, &mut em, &mut code, 0, u64::MAX, None, 0, &Conts::default(), &BTreeSet::new(), 1, &mut blocks, &mut flags);
+            guards_outweigh_the_code = sctx.guard_bytes.get() * GUARDS_OUTWEIGH_THE_CODE > code.len();
         } else {
             if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
                 code.push_str("    uint pc = xcl_entry_pc;\n");
@@ -1466,9 +1561,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
         body.push_str(&code);
     }
-    let hlsl = em.finish(&body);
-    let static_samplers = em.static_used.clone();
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+    Emitted { em, body, blocks, guards_outweigh_the_code }
 }
 
 #[cfg(test)]

@@ -130,8 +130,16 @@ pub fn uses(d: &Decoded) -> (Regs, Regs) {
 /// For each instruction (index in `insts`): the SGPRs whose whole value may be read after it.
 /// `end_reads_all`: the program's end reads every SGPR (kernel mode).
 pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
+    let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(uses).collect();
+    flow_live_out(insts, &gen_kill, if end_reads_all { ALL } else { EXEC }, EXEC)
+}
+
+/// Backward liveness of a register set over the program's control flow: for each instruction
+/// the registers that may be read after it. `gen_kill`: per instruction (read, overwritten);
+/// `at_end`: read by the program's end; `always_live`: never dead. Also used by
+/// `scc_liveness`.
+pub(super) fn flow_live_out(insts: &[Decoded], gen_kill: &[(Regs, Regs)], at_end: Regs, always_live: Regs) -> Vec<Regs> {
     let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-    let at_end = if end_reads_all { ALL } else { EXEC };
     // successors; None = unknown (indirect): everything is live
     let succ: Vec<Option<Vec<usize>>> = insts
         .iter()
@@ -167,7 +175,6 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
         .iter()
         .map(|d| loops.iter().filter(|&&(a, b)| a <= d.pc && d.pc < b).map(|&(_, b)| pcs.range(b..).next().map(|(_, &j)| j)).collect())
         .collect();
-    let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(uses).collect();
     let mut live_in = vec![0 as Regs; insts.len()];
     let mut live_out = vec![0 as Regs; insts.len()];
     loop {
@@ -176,11 +183,11 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
             let out = match &succ[i] {
                 None => ALL,
                 Some(s) if s.is_empty() => at_end,
-                Some(s) => s.iter().fold(EXEC, |m, &j| m | live_in[j]),
+                Some(s) => s.iter().fold(always_live, |m, &j| m | live_in[j]),
             };
             let left = exits[i].iter().fold(0, |m, e| m | at_end | e.map_or(0, |j| live_in[j]));
             let (gen, kill) = gen_kill[i];
-            let inn = gen | (out & !kill) | left | EXEC;
+            let inn = gen | (out & !kill) | left | always_live;
             if out != live_out[i] || inn != live_in[i] {
                 live_out[i] = out;
                 live_in[i] = inn;

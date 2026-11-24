@@ -43,6 +43,8 @@ pub(super) struct Em {
     /// split wave64: pc → SGPRs whose whole value may be read after that instruction
     /// (`x64_masks`); a mask written to none of them stays in its half (no exchange)
     pub x64_whole_live: BTreeMap<u64, u128>,
+    /// pcs of the instructions whose SCC write nothing reads (`scc_liveness`): not emitted
+    pub dead_scc_writes: BTreeSet<u64>,
     /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
     /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
     pub upper: Option<super::upper_lanes::UpperLanes>,
@@ -64,7 +66,15 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    pub predication: super::predication::Plan,
+    pub lane_trace: Option<super::predication::Trace>,
 }
+
+/// Compute programs: the lane's bit of EXEC (`Em::keeps_lane_test`).
+const LANE_ACTIVE: &str = "xcl_active";
+/// One nesting level of the emitted HLSL. One space: large programs nest 15+ levels deep and
+/// four spaces per level were over half their bytes.
+pub(super) const INDENT: &str = " ";
 
 /// Instructions without an effect in this execution model.
 const NOOPS: &[&str] = &[
@@ -73,6 +83,47 @@ const NOOPS: &[&str] = &[
     "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_sendmsg", "s_sendmsghalt",
     "s_set_gpr_idx_off", "s_version", "buffer_gl0_inv", "buffer_gl1_inv", "ds_nop",
 ];
+
+fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Whether `expression` reads `identifier` as a whole token (`s1` is not in `s10`).
+fn mentions_identifier(expression: &str, identifier: &str) -> bool {
+    expression.split(|c| !is_identifier_char(c)).any(|token| token == identifier)
+}
+
+/// `expression` with every whole-token `from` replaced by `to`.
+fn replace_identifier(expression: &str, from: &str, to: &str) -> String {
+    let mut replaced = String::with_capacity(expression.len());
+    let mut rest = expression;
+    while !rest.is_empty() {
+        let in_token = rest.starts_with(is_identifier_char);
+        let end = rest.find(|c| is_identifier_char(c) != in_token).unwrap_or(rest.len());
+        let (run, tail) = rest.split_at(end);
+        replaced.push_str(if in_token && run == from { to } else { run });
+        rest = tail;
+    }
+    replaced
+}
+
+fn scalar_register_name(dst: &Dst) -> Option<String> {
+    match dst {
+        Dst::S(n) => sname(*n),
+        _ => None,
+    }
+}
+
+fn scalar_register_pair_names(dst: &Dst) -> Option<(String, String)> {
+    match dst {
+        Dst::S(n) => Some((sname(*n)?, sname(*n + 1)?)),
+        _ => None,
+    }
+}
+
+fn is_register_named(dst: &Dst, name: &str) -> bool {
+    scalar_register_name(dst).is_some_and(|register| register == name)
+}
 
 fn sname(code: u64) -> Option<String> {
     Some(match code {
@@ -481,6 +532,7 @@ impl Em {
             uses_scratch: false,
             x64_words: 1,
             x64_whole_live: BTreeMap::new(),
+            dead_scc_writes: BTreeSet::new(),
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
@@ -490,6 +542,8 @@ impl Em {
             has_f64_round_op: false,
             dynamic_f16_rm: false,
             safe_barrier: false,
+            predication: Default::default(),
+            lane_trace: None,
         }
     }
 
@@ -558,11 +612,44 @@ impl Em {
     }
 
     fn line(&mut self, s: &str) {
+        let (pc, lane_test) = (self.cur_pc, self.lane_test());
+        if let Some(trace) = &mut self.lane_trace {
+            trace.statement(pc, s, lane_test);
+        }
+        self.push_line(s);
+    }
+
+    fn push_line(&mut self, s: &str) {
         for _ in 0..self.indent {
-            self.out.push_str("    ");
+            self.out.push_str(INDENT);
         }
         self.out.push_str(s);
         self.out.push('\n');
+        if self.keeps_lane_test() && super::predication::assigns_exec(s) {
+            let refresh = format!("{LANE_ACTIVE} = {};", self.exec_lane_test());
+            self.push_line(&refresh);
+        }
+    }
+
+    /// Compute programs keep the lane's EXEC bit in `xcl_active`, refreshed after every
+    /// statement that assigns EXEC: the big ones were compiled at -O0 when this was added (at -O1
+    /// since, `dxc::optimisation_level_for`), where each
+    /// `lanebit(exec_lo, exec_hi)` of a predicated write is its own shift, mask and compare.
+    fn keeps_lane_test(&self) -> bool {
+        matches!(self.opt.mode, Mode::Compute(_))
+    }
+
+    /// `scc = value;` unless no path reads what the current instruction writes to SCC.
+    fn set_scc(&mut self, value: &str) {
+        if !self.dead_scc_writes.contains(&self.cur_pc) {
+            self.line(&format!("scc = {value};"));
+        }
+    }
+
+    /// The SCC condition of the current instruction if anything reads it (`dead_scc_writes`): one
+    /// that nothing reads is not written and so cannot keep a temporary alive either.
+    fn read_scc_write<'a>(&self, scc: Option<&'a str>) -> Option<&'a str> {
+        scc.filter(|_| !self.dead_scc_writes.contains(&self.cur_pc))
     }
 
     fn t(&mut self) -> String {
@@ -606,6 +693,35 @@ impl Em {
     }
 
     fn act(&self) -> &'static str {
+        if self.predication.exec_covers_every_lane(self.cur_pc) {
+            "true"
+        } else {
+            self.lane_test()
+        }
+    }
+
+    fn lane_write(&mut self, n: u64, val: &str) -> String {
+        let v = self.vreg(n);
+        let (pc, lane_test) = (self.cur_pc, self.lane_test());
+        if let Some(trace) = &mut self.lane_trace {
+            trace.lane_write(pc, n, val, lane_test);
+        }
+        if self.predication.writes_every_lane(pc, n) {
+            format!("{v} = {val};")
+        } else {
+            format!("{v} = select({lane_test}, {val}, {v});")
+        }
+    }
+
+    fn lane_test(&self) -> &'static str {
+        if self.keeps_lane_test() {
+            LANE_ACTIVE
+        } else {
+            self.exec_lane_test()
+        }
+    }
+
+    fn exec_lane_test(&self) -> &'static str {
         // no short-circuit `?:` (HLSL 2021 makes it a branch – one per instruction at -O0)
         if self.opt.wave64 {
             "lanebit(exec_lo, exec_hi)"
@@ -791,9 +907,8 @@ impl Em {
             // select, not `if`: straight-line code (a branch per VALU write was more than the
             // driver's compiler could take on a 15 000-instruction console shader)
             Dst::V(n) => {
-                let v = self.vreg(*n);
-                let a = self.act();
-                self.line(&format!("{v} = select({a}, {val}, {v});"));
+                let write = self.lane_write(*n, val);
+                self.push_line(&write);
             }
             Dst::S(n) => {
                 let s = self.sreg(*n);
@@ -806,9 +921,8 @@ impl Em {
     fn write64(&mut self, dst: &Dst, lo: &str, hi: &str) {
         match dst {
             Dst::V(n) => {
-                let (a, b) = (self.vreg(*n), self.vreg(*n + 1));
-                let act = self.act();
-                self.line(&format!("{a} = select({act}, {lo}, {a}); {b} = select({act}, {hi}, {b});"));
+                let (low, high) = (self.lane_write(*n, lo), self.lane_write(*n + 1, hi));
+                self.push_line(&format!("{low} {high}"));
             }
             Dst::S(n) => {
                 let (a, b) = (self.sreg(*n), self.sreg(*n + 1));
@@ -834,10 +948,20 @@ impl Em {
             ballot = "xcl_x_ballot_local";
         }
         self.line(&format!("uint2 {m} = {ballot}(and({a}, ({cond})));"));
+        self.trace_exec_bounded_mask(dst);
         if self.opt.wave64 {
             self.write64(dst, &format!("{m}.x"), &format!("{m}.y"));
         } else {
             self.write32(dst, &format!("{m}.x"));
+        }
+    }
+
+    fn trace_exec_bounded_mask(&mut self, dst: &Dst) {
+        let (pc, words) = (self.cur_pc, if self.opt.wave64 { 2 } else { 1 });
+        if let (Some(trace), Dst::S(n)) = (&mut self.lane_trace, dst) {
+            for word in 0..words {
+                trace.exec_bounded_mask(pc, *n + word as u64, word);
+            }
         }
     }
 
@@ -853,9 +977,13 @@ impl Em {
 
     pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
         let name = d.inst.name.to_ascii_lowercase();
-        let text = rdna2::format(d);
-        self.line(&format!("// {:04x}: {text}", d.pc));
+        if self.opt.source_comments {
+            self.line(&format!("// {:04x}: {}", d.pc, rdna2::format(d)));
+        }
         self.cur_pc = d.pc;
+        if let Some(trace) = &mut self.lane_trace {
+            trace.begin_instruction();
+        }
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {
             return Flow::Jump(t);
@@ -1072,14 +1200,14 @@ impl Em {
                 "s_addk_i32" => {
                     let t = self.t();
                     self.line(&format!("uint {t} = {cur} + {};", hex(k_s)));
-                    self.line(&format!("scc = ((({cur} ^ {t}) & ({} ^ {t})) >> 31);", hex(k_s)));
+                    self.set_scc(&format!("((({cur} ^ {t}) & ({} ^ {t})) >> 31)", hex(k_s)));
                     self.write32(&dst, &t);
                 }
                 "s_mulk_i32" => self.write32(&dst, &format!("(uint)((int){cur} * {})", k_s as i32)),
                 _ if name.starts_with("s_cmpk_") => {
                     let (op, signed) = cmp_op(&name[7..]).ok_or("comparison")?;
                     let (a, b) = if signed { (format!("(int){cur}"), format!("{}", k_s as i32)) } else { (cur.clone(), format!("{k_u}u")) };
-                    self.line(&format!("scc = (uint)({a} {op} {b});"));
+                    self.set_scc(&format!("(uint)({a} {op} {b})"));
                 }
                 _ => return Err("SOPK"),
             }
@@ -1091,9 +1219,9 @@ impl Em {
                 let b = self.read(d, ins[1], false).ok_or("op")?;
                 let bit = format!("((select(({b} & 32u) == 0u, {a0}, {a1}) >> ({b} & 31u)) & 1u)");
                 if name == "s_bitcmp0_b64" {
-                    self.line(&format!("scc = (uint)({bit} == 0u);"));
+                    self.set_scc(&format!("(uint)({bit} == 0u)"));
                 } else {
-                    self.line(&format!("scc = {bit};"));
+                    self.set_scc(&bit);
                 }
                 return Ok(());
             }
@@ -1106,19 +1234,19 @@ impl Em {
                     _ => return Err("SOPC"),
                 };
                 let j = if op == "==" { "&&" } else { "||" };
-                self.line(&format!("scc = (uint)({} {op} {} {j} {} {op} {});", a.0, b.0, a.1, b.1));
+                self.set_scc(&format!("(uint)({} {op} {} {j} {} {op} {})", a.0, b.0, a.1, b.1));
                 return Ok(());
             }
             let (a, b) = (self.read(d, ins[0], false).ok_or("op")?, self.read(d, ins[1], false).ok_or("op")?);
             if let Some(rest) = name.strip_prefix("s_cmp_") {
                 let (op, signed) = cmp_op(rest).ok_or("comparison")?;
                 let (a, b) = if signed { (format!("(int){a}"), format!("(int){b}")) } else { (a, b) };
-                self.line(&format!("scc = (uint)({a} {op} {b});"));
+                self.set_scc(&format!("(uint)({a} {op} {b})"));
                 return Ok(());
             }
             match name {
-                "s_bitcmp0_b32" => self.line(&format!("scc = (uint)((({a} >> ({b} & 31u)) & 1u) == 0u);")),
-                "s_bitcmp1_b32" => self.line(&format!("scc = (({a} >> ({b} & 31u)) & 1u);")),
+                "s_bitcmp0_b32" => self.set_scc(&format!("(uint)((({a} >> ({b} & 31u)) & 1u) == 0u)")),
+                "s_bitcmp1_b32" => self.set_scc(&format!("(({a} >> ({b} & 31u)) & 1u)")),
                 _ => return Err("SOPC"),
             }
             return Ok(());
@@ -1145,24 +1273,12 @@ impl Em {
                 let s0 = self.read(d, ins[0], false).ok_or("op")?;
                 let el = self.sreg(126);
                 let nl = op(&s0, &el).ok_or("saveexec")?;
-                let (t0, o0) = (self.t(), self.t());
-                self.line(&format!("uint {o0} = {el};"));
-                self.line(&format!("uint {t0} = {nl};"));
-                self.line(&format!("{el} = {t0};"));
-                self.line(&format!("scc = (uint)({t0} != 0u);"));
-                let v = if name.contains("wrexec") { t0 } else { o0 };
-                self.write32(&dst, &v);
+                self.write_saveexec(&dst, name.contains("wrexec"), &[el], &[nl]);
             } else {
                 let s0 = self.read64(d, ins[0], false).ok_or("op")?;
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let (nl, nh) = (op(&s0.0, &el).ok_or("saveexec")?, op(&s0.1, &eh).ok_or("saveexec")?);
-                let (t0, t1, o0, o1) = (self.t(), self.t(), self.t(), self.t());
-                self.line(&format!("uint {o0} = {el}; uint {o1} = {eh};"));
-                self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
-                self.line(&format!("{el} = {t0}; {eh} = {t1};"));
-                self.line(&format!("scc = (uint)(({t0} | {t1}) != 0u);"));
-                let (a, b) = if name.contains("wrexec") { (t0, t1) } else { (o0, o1) };
-                self.write64(&dst, &a, &b);
+                self.write_saveexec(&dst, name.contains("wrexec"), &[el, eh], &[nl, nh]);
             }
             return Ok(());
         }
@@ -1282,12 +1398,119 @@ impl Em {
             "s_pack_hh_b32_b16" => (format!("({a} >> 16) | ({b} & 0xFFFF0000u)"), None),
             _ => return Err("SALU"),
         };
-        self.line(&format!("uint {t} = {res};"));
-        if let Some(c) = scc {
-            self.line(&format!("scc = (uint)({c});"));
+        // a register moved onto itself
+        if name == "s_mov_b32" && is_register_named(&dst, &a) {
+            return Ok(());
         }
-        self.write32(&dst, &t);
+        self.write_scalar_result(&dst, &t, &res, scc.as_deref());
         Ok(())
+    }
+
+    fn write_halves(&mut self, dst: &Dst, values: &[String]) {
+        match values {
+            [lo, hi] => self.write64(dst, lo, hi),
+            [lo] => self.write32(dst, lo),
+            _ => {}
+        }
+    }
+
+    fn declare_halves(&mut self, values: &[String]) -> Vec<String> {
+        let temps: Vec<String> = values.iter().map(|_| self.t()).collect();
+        let declarations: Vec<String> = temps.iter().zip(values).map(|(t, v)| format!("uint {t} = {v};")).collect();
+        self.line(&declarations.join(" "));
+        temps
+    }
+
+    /// s_*_saveexec / s_*_wrexec: exec = `new_exec`, SCC = exec != 0, dst = the old exec (or the
+    /// new one for wrexec). Buffers only what a later write would clobber: nothing when dst does
+    /// not feed the new mask, the old exec when it does, both when dst is exec itself.
+    fn write_saveexec(&mut self, dst: &Dst, dst_gets_new_exec: bool, exec: &[String], new_exec: &[String]) {
+        let exec_dst = Dst::S(126);
+        let nonzero = format!("(uint)(({}) != 0u)", exec.join(" | "));
+        let dst_halves: Vec<String> = match dst {
+            Dst::S(n) => (0..exec.len() as u64).filter_map(|half| sname(n + half)).collect(),
+            _ => Vec::new(),
+        };
+        let reads_any = |expressions: &[String], names: &[String]| names.iter().any(|n| expressions.iter().any(|e| mentions_identifier(e, n)));
+        let dst_overlaps_exec = dst_halves.iter().any(|d| exec.contains(d));
+        let high_half_reads_low_exec = new_exec.len() == 2 && mentions_identifier(&new_exec[1], &exec[0]);
+        if dst_overlaps_exec || high_half_reads_low_exec {
+            let old = self.declare_halves(exec);
+            let new = self.declare_halves(new_exec);
+            self.write_halves(&exec_dst, &new);
+            self.set_scc(&nonzero);
+            self.write_halves(dst, if dst_gets_new_exec { &new } else { &old });
+        } else if dst_gets_new_exec || dst_halves.is_empty() {
+            self.write_halves(&exec_dst, new_exec);
+            self.set_scc(&nonzero);
+            if dst_gets_new_exec {
+                self.write_halves(dst, exec);
+            }
+        } else if reads_any(new_exec, &dst_halves) {
+            let old = self.declare_halves(exec);
+            self.write_halves(&exec_dst, new_exec);
+            self.set_scc(&nonzero);
+            self.write_halves(dst, &old);
+        } else {
+            self.write_halves(dst, exec);
+            self.write_halves(&exec_dst, new_exec);
+            self.set_scc(&nonzero);
+        }
+    }
+
+    /// `dst = value; scc = cond(dst)` – `scc` is written over `temp`, which stands for the
+    /// result. The temporary is only declared when the SCC condition still reads the old
+    /// destination (s_add_u32 s0, s0, s1: carry = result < s0) or there is no register to read
+    /// the result back from.
+    fn write_scalar_result(&mut self, dst: &Dst, temp: &str, value: &str, scc: Option<&str>) {
+        let scc = self.read_scc_write(scc);
+        let register = scalar_register_name(dst);
+        let scc_reads_register = register.as_ref().is_some_and(|r| scc.is_some_and(|c| mentions_identifier(c, r)));
+        match register {
+            None if scc.is_none() && matches!(dst, Dst::Null) => {}
+            Some(register) if !scc_reads_register => {
+                self.write32(dst, value);
+                if let Some(c) = scc {
+                    self.line(&format!("scc = (uint)({});", replace_identifier(c, temp, &register)));
+                }
+            }
+            _ => {
+                self.line(&format!("uint {temp} = {value};"));
+                if let Some(c) = scc {
+                    self.line(&format!("scc = (uint)({c});"));
+                }
+                self.write32(dst, temp);
+            }
+        }
+    }
+
+    /// 64-bit form of `write_scalar_result`: the low half is written before the high one is
+    /// evaluated, so a high half reading the low destination (s_mov_b64 s[8:9], s[7:8]) keeps
+    /// the temporaries; a pair moved onto itself writes nothing.
+    fn write_scalar_pair_result(&mut self, dst: &Dst, temps: (&str, &str), values: (&str, &str), scc: Option<&str>) {
+        let scc = self.read_scc_write(scc);
+        let registers = scalar_register_pair_names(dst);
+        let overlaps = registers.as_ref().is_some_and(|(lo, hi)| {
+            mentions_identifier(values.1, lo) || scc.is_some_and(|c| mentions_identifier(c, lo) || mentions_identifier(c, hi))
+        });
+        match registers {
+            None if scc.is_none() && matches!(dst, Dst::Null) => {}
+            Some((lo, hi)) if !overlaps => {
+                if (values.0, values.1) != (lo.as_str(), hi.as_str()) {
+                    self.write64(dst, values.0, values.1);
+                }
+                if let Some(c) = scc {
+                    self.line(&format!("scc = (uint)({});", replace_identifier(&replace_identifier(c, temps.0, &lo), temps.1, &hi)));
+                }
+            }
+            _ => {
+                self.line(&format!("uint {} = {}; uint {} = {};", temps.0, values.0, temps.1, values.1));
+                if let Some(c) = scc {
+                    self.line(&format!("scc = (uint)({c});"));
+                }
+                self.write64(dst, temps.0, temps.1);
+            }
+        }
     }
 
     /// Scalar relative moves: uniform M0 selects an SGPR from the encoded base. HLSL has
@@ -1455,14 +1678,10 @@ impl Em {
                 }
             }
         };
-        self.line(&format!("uint {t0} = {lo}; uint {t1} = {hi};"));
-        if let Some(c) = scc {
-            self.line(&format!("scc = (uint)({c});"));
-        }
         if matches!(name, "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" | "s_ff0_i32_b64" | "s_ff1_i32_b64" | "s_flbit_i32_b64" | "s_flbit_i32_i64") {
-            self.write32(dst, &t0);
+            self.write_scalar_result(dst, &t0, &lo, scc.as_deref());
         } else {
-            self.write64(dst, &t0, &t1);
+            self.write_scalar_pair_result(dst, (&t0, &t1), (&lo, &hi), scc.as_deref());
         }
         Ok(())
     }
@@ -4435,6 +4654,7 @@ impl Em {
                     let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                let _ = writeln!(h, "    bool {LANE_ACTIVE} = {};", self.exec_lane_test());
                 for &v in &self.vgprs {
                     let init = match v {
                         0 => "gtid.x",
