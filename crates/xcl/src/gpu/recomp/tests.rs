@@ -8023,3 +8023,185 @@ fn a_program_with_more_guard_than_code_is_emitted_as_the_block_chain() {
     let targets_run: u32 = (TAKEN_AT as usize..jumps).map(step).sum();
     assert_eq!((r.sgpr[1], r.sgpr[2]), (TAKEN_AT + 1, targets_run));
 }
+
+fn misc_vs() -> (Vec<u8>, super::VsInterface) {
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 128)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 13), ("EN", 0x4), ("VSRC0", 12), ("VSRC1", 12), ("VSRC2", 12), ("VSRC3", 12), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+    ]);
+    let vsi = super::VsInterface {
+        inputs: vec![el("POSITION", 0, 0, 3, 0, 3), el("COLOR", 0, 0, 3, 1, 0xF)],
+        outputs: vec![
+            el("SV_Position", 0, 1, 3, 0, 0xF),
+            el("COLOR", 0, 0, 3, 1, 0xF),
+            el("SV_RenderTargetArrayIndex", 0, super::SV_RENDER_TARGET_ARRAY_INDEX, 1, 2, 1),
+            el("SV_ViewportArrayIndex", 0, super::SV_VIEWPORT_ARRAY_INDEX, 1, 2, 2),
+        ],
+        attr_base: 4,
+        params: None,
+    };
+    (code, vsi)
+}
+
+const DXIL_FEATURE_VIEWPORT_AND_RT_ARRAY_INDEX: u64 = 0x2000;
+
+fn dxil_feature_flags(dxil: &[u8]) -> u64 {
+    let part = crate::gpu::shader::container_parts(dxil).unwrap().into_iter().find(|p| p.fourcc == "SFI0").unwrap();
+    u64::from_le_bytes(dxil[part.offset..part.offset + 8].try_into().unwrap())
+}
+
+#[test]
+fn vs_misc_vector_exports_layer_and_viewport() {
+    let (code, vsi) = misc_vs();
+    let t = translate(&code, &Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("    nointerpolation uint xcl_layer : SV_RenderTargetArrayIndex;\n    nointerpolation uint xcl_viewport : SV_ViewportArrayIndex;\n};"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("xo.xcl_layer = (v12 & 65535u); xo.xcl_viewport = (v12 >> 16u);"), "{}", t.hlsl);
+    let mut clip_only = vsi.clone();
+    clip_only.outputs.truncate(2);
+    clip_only.outputs.push(el("SV_ClipDistance", 0, 2, 3, 2, 1));
+    let c = translate(&code, &Options { mode: Mode::Vertex(clip_only), wave64: true, ..Default::default() }).unwrap();
+    assert!(!c.hlsl.contains("xcl_layer") && !c.hlsl.contains("xcl_viewport") && !c.hlsl.contains("v12 &"), "{}", c.hlsl);
+    if super::dxc::location().is_ok() {
+        let dxil = super::dxc::compile(&t.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        assert_ne!(dxil_feature_flags(&dxil) & DXIL_FEATURE_VIEWPORT_AND_RT_ARRAY_INDEX, 0);
+        let plain = super::dxc::compile(&c.hlsl, "main", "vs_6_6", &[]).unwrap();
+        assert_eq!(dxil_feature_flags(&plain) & DXIL_FEATURE_VIEWPORT_AND_RT_ARRAY_INDEX, 0);
+    }
+}
+
+#[test]
+fn misc_vector_only_with_layer_outputs() {
+    use super::{has_misc_vector, MsInterface};
+    let clip = vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 3, 1, 0xF), el("SV_ClipDistance", 0, 2, 3, 2, 3)];
+    assert!(!has_misc_vector(&clip));
+    let plain = MsInterface { outputs: clip.clone(), threads: 64, max_vertices: 64, max_primitives: 64 };
+    assert_eq!((plain.vert_dwords(), plain.misc_dword()), (12, 12));
+    let mut layered = plain.clone();
+    layered.outputs.push(el("SV_RenderTargetArrayIndex", 0, super::SV_RENDER_TARGET_ARRAY_INDEX, 1, 3, 1));
+    assert!(has_misc_vector(&layered.outputs));
+    assert_eq!((layered.vert_dwords(), layered.misc_dword()), (13, 12));
+    assert!(!super::emit::mesh_passthrough(&plain).contains("XclPrim"));
+}
+
+#[test]
+fn mesh_misc_vector_goes_to_primitive_outputs() {
+    use super::MsInterface;
+    let ms = MsInterface {
+        outputs: vec![
+            el("SV_Position", 0, 1, 3, 0, 0xF),
+            el("TEXCOORD", 0, 0, 3, 1, 0xF),
+            el("SV_ClipDistance", 0, 2, 3, 2, 1),
+            el("SV_ViewportArrayIndex", 0, super::SV_VIEWPORT_ARRAY_INDEX, 1, 3, 1),
+            el("SV_RenderTargetArrayIndex", 0, super::SV_RENDER_TARGET_ARRAY_INDEX, 1, 3, 2),
+        ],
+        threads: 64,
+        max_vertices: 64,
+        max_primitives: 64,
+    };
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 255)], Some(3 << 16 | 5)),
+        ("EXP", "ENC_EXP", &[("TGT", 13), ("EN", 0x4), ("VSRC0", 12), ("VSRC1", 12), ("VSRC2", 12), ("VSRC3", 12)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 14), ("EN", 0x1), ("VSRC0", 12), ("VSRC1", 12), ("VSRC2", 12), ("VSRC3", 12)], None),
+    ]);
+    let t = translate(&code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(ms.misc_dword(), 12);
+    assert!(t.hlsl.contains("res.Store((xcl_vtx + 12u) * 4u, v12);"), "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("res.Store((xcl_vtx + ").count(), 1, "{}", t.hlsl);
+    let pass = super::emit::mesh_passthrough(&ms);
+    assert!(pass.contains("struct XclPrim {\n    nointerpolation uint xcl_layer : SV_RenderTargetArrayIndex;\n    nointerpolation uint xcl_viewport : SV_ViewportArrayIndex;\n};"), "{pass}");
+    assert!(pass.contains(", out primitives XclPrim prims[64])"), "{pass}");
+    assert!(pass.contains("q.xcl_layer = (m & 65535u);") && pass.contains("q.xcl_viewport = (m >> 16u);") && pass.contains("prims[j] = q;"), "{pass}");
+    let ins: Vec<crate::gpu::dxbc::SigElement> = (0..16).map(|k| el("TEXCOORD", k, 0, 3, k + 1, 0xF)).collect();
+    let elements = super::emit::passthrough_elements(&ms, Some(&ins));
+    let plain = MsInterface { outputs: ms.outputs[..3].to_vec(), ..ms.clone() };
+    assert!(super::emit::passthrough_split(&ms, elements) >= super::emit::passthrough_split(&plain, elements));
+    let pass16 = super::emit::mesh_passthrough_for(&ms, Some(&ins));
+    assert!(pass16.contains(", out primitives XclPrim prims[") && pass16.matches("prims[j] = q;").count() == 1, "{pass16}");
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+        super::dxc::compile(&pass16, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass16}"));
+    }
+}
+
+#[test]
+fn gs_misc_vector_from_lds_registers() {
+    use super::GsInterface;
+    let g = GsInterface {
+        outputs: vec![
+            el("SV_Position", 0, 1, 3, 0, 0xF),
+            el("TEXCOORD", 0, 0, 3, 1, 0xF),
+            el("SV_RenderTargetArrayIndex", 0, super::SV_RENDER_TARGET_ARRAY_INDEX, 1, 2, 2),
+        ],
+        max_vertex_count: 3,
+        gs_start: Some(0),
+        ..Default::default()
+    };
+    let code = prog(&[("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x3)], None)]);
+    assert_eq!(g.record().misc_dword(), 8);
+    let want = "res.Store((dst + 8u) * 4u, (xcl_lds[((src + 36u) >> 2) & 8191u] & 65535u) | (0u << 16u));";
+    for split_wave64 in [false, true] {
+        let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, split_wave64, ..Default::default() }).unwrap();
+        assert!(t.hlsl.contains(want), "split {split_wave64}: {}", t.hlsl);
+    }
+    let plain = GsInterface { outputs: g.outputs[..2].to_vec(), ..g.clone() };
+    let t = translate(&code, &Options { mode: Mode::Geometry(plain), wave64: true, ..Default::default() }).unwrap();
+    assert!(!t.hlsl.contains("(dst + 8u)"), "{}", t.hlsl);
+}
+
+#[test]
+fn gpu_vs_misc_vector_draws_layer_zero() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
+    let (code, vsi) = misc_vs();
+    let t = translate(&code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
+    let vs = super::dxc::compile(&t.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let ps = super::dxc::compile("float4 main(float4 pos : SV_Position, float4 c : COLOR0) : SV_Target { return c; }\n", "main", "ps_6_6", &[]).unwrap();
+    let c = [0.8f32, 0.6, 0.4, 1.0];
+    let verts: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|p| [p[0], p[1], c[0], c[1], c[2], c[3]]).collect();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
+    ];
+    let px = runner::draw(&vs, &ps, &layout, &verts, 24, &[], &[], 8, [0.0; 4]).unwrap();
+    assert!(px.iter().all(|p| *p == c), "{px:?}");
+}
+
+#[test]
+fn gpu_mesh_passthrough_with_primitive_layer() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, MsInterface};
+    let ms = MsInterface {
+        outputs: vec![
+            el("SV_Position", 0, 1, 3, 0, 0xF),
+            el("TEXCOORD", 0, 0, 3, 1, 0xF),
+            el("SV_RenderTargetArrayIndex", 0, super::SV_RENDER_TARGET_ARRAY_INDEX, 1, 2, 1),
+        ],
+        threads: 32,
+        max_vertices: 3,
+        max_primitives: 1,
+    };
+    let (vd, misc) = (ms.vert_dwords(), ms.misc_dword());
+    let cs_src = format!(
+        "RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n[numthreads(1, 1, 1)]\nvoid main()\n{{\n    res.Store2(0u, uint2(3u, 1u));\n    float2 p[3] = {{ float2(-1.0, -1.0), float2(-1.0, 3.0), float2(3.0, -1.0) }};\n    for (uint i = 0u; i < 3u; i++) {{\n        uint b = ({h}u + i * {vd}u) * 4u;\n        res.Store4(b, asuint(float4(p[i], 0.0, 1.0)));\n        res.Store4(b + 16u, asuint(float4(0.25, 0.5, 0.75, 1.0)));\n        res.Store(b + {m}u, 0u);\n    }}\n    res.Store(({h}u + 3u * {vd}u) * 4u, 1u << 10 | 2u << 20);\n}}\n",
+        h = super::MESH_HEADER,
+        m = 4 * misc
+    );
+    let cs = dxc::compile(&cs_src, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{cs_src}"));
+    let pass = super::emit::mesh_passthrough(&ms);
+    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+    let ps = dxc::compile("struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n", "main", "ps_6_6", &[]).unwrap();
+    let (px, _) = runner::mesh_draw(&cs, &msb, &ps, 1, ms.record_dwords(), &[0u32; 128], &[0u32; 64], 8, [-1.0; 4]).unwrap();
+    assert!(px.iter().all(|p| *p == [0.25, 0.5, 0.75, 1.0]), "{px:?}");
+}
