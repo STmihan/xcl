@@ -15,6 +15,7 @@ pub mod console_heap;
 pub mod console_list;
 pub mod device_x;
 pub mod dxgi_device;
+pub mod empty_views;
 mod cpu_writes;
 mod fence_x;
 pub mod frame;
@@ -82,6 +83,7 @@ pub fn backend() -> Backend {
         match real::init() {
             Ok(desc) => {
                 crate::xlog_info!("D3D12.X: backend 'real' – {desc}");
+                pso_async::check_frame_budget();
                 Backend::Real
             }
             Err(e) => {

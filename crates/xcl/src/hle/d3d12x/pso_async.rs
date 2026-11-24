@@ -627,6 +627,188 @@ mod used_tests {
     }
 }
 
+#[cfg(test)]
+mod frame_budget_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const MS: Duration = Duration::from_millis(1);
+
+    fn budget(limit_ms: u32, window_ms: u32, kinds: FrameWaitKinds, now: Instant) -> FrameBudget {
+        FrameBudget::new(MS * limit_ms, MS * window_ms, kinds, now)
+    }
+
+    #[test]
+    fn the_frame_budget_is_off_unless_its_milliseconds_are_set() {
+        let now = Instant::now();
+        assert!(FrameBudget::parse(None, None, None, now).unwrap().is_none());
+        assert!(FrameBudget::parse(Some("0"), None, None, now).unwrap().is_none());
+        assert!(FrameBudget::parse(Some(" "), Some("1000"), Some("all"), now).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_frame_budget_without_its_window_or_kinds_is_an_error() {
+        let now = Instant::now();
+        let missing_window = FrameBudget::parse(Some("200"), None, Some("compute"), now).err().unwrap();
+        assert!(missing_window.contains(FRAME_WAIT_WINDOW_MS_VAR), "{missing_window}");
+        let zero_window = FrameBudget::parse(Some("200"), Some("0"), Some("compute"), now).err().unwrap();
+        assert!(zero_window.contains(FRAME_WAIT_WINDOW_MS_VAR), "{zero_window}");
+        let missing_kinds = FrameBudget::parse(Some("200"), Some("1000"), None, now).err().unwrap();
+        assert!(missing_kinds.contains(FRAME_WAIT_KINDS_VAR), "{missing_kinds}");
+        let wrong_kinds = FrameBudget::parse(Some("200"), Some("1000"), Some("pixel"), now).err().unwrap();
+        assert!(wrong_kinds.contains(FRAME_WAIT_KINDS_VAR), "{wrong_kinds}");
+        let wrong_ms = FrameBudget::parse(Some("lots"), Some("1000"), Some("all"), now).err().unwrap();
+        assert!(wrong_ms.contains(FRAME_WAIT_MS_VAR), "{wrong_ms}");
+        let f = FrameBudget::parse(Some("200"), Some("1000"), Some(" Graphics "), now).unwrap().unwrap();
+        assert_eq!((f.limit, f.window, f.kinds), (MS * 200, MS * 1000, FrameWaitKinds::Graphics));
+    }
+
+    #[test]
+    fn the_kinds_say_which_binds_the_budget_covers() {
+        assert!(FrameWaitKinds::Compute.covers(true) && !FrameWaitKinds::Compute.covers(false));
+        assert!(FrameWaitKinds::Graphics.covers(false) && !FrameWaitKinds::Graphics.covers(true));
+        assert!(FrameWaitKinds::All.covers(true) && FrameWaitKinds::All.covers(false));
+    }
+
+    #[test]
+    fn waits_are_charged_to_the_frame_until_a_present_renews_it() {
+        let t0 = Instant::now();
+        let f = budget(100, 60_000, FrameWaitKinds::All, t0);
+        let (left, epoch) = f.left(t0);
+        assert_eq!(left, MS * 100);
+        f.charge(epoch, MS * 30);
+        f.charge(epoch, MS * 50);
+        assert_eq!(f.left(t0 + MS).0, MS * 20);
+        f.charge(epoch, MS * 500);
+        assert_eq!(f.left(t0 + MS).0, Duration::ZERO, "spent: nothing is left, not less");
+        f.presented(t0 + MS * 2);
+        let (left, renewed) = f.left(t0 + MS * 3);
+        assert_eq!(left, MS * 100);
+        f.charge(epoch, MS * 40);
+        assert_eq!(f.left(t0 + MS * 3).0, MS * 100, "a wait that began before the present is not charged to the new frame");
+        f.charge(renewed, MS * 40);
+        assert_eq!(f.left(t0 + MS * 3).0, MS * 60);
+    }
+
+    #[test]
+    fn the_budget_is_renewed_when_its_window_passes_without_a_present() {
+        let t0 = Instant::now();
+        let f = budget(100, 1_000, FrameWaitKinds::Compute, t0);
+        let (_, epoch) = f.left(t0);
+        f.charge(epoch, MS * 100);
+        assert_eq!(f.left(t0 + MS * 999).0, Duration::ZERO);
+        assert_eq!(f.left(t0 + MS * 1_000).0, MS * 100, "the window passed");
+        let (_, epoch) = f.left(t0 + MS * 1_000);
+        f.charge(epoch, MS * 100);
+        assert_eq!(f.left(t0 + MS * 1_500).0, Duration::ZERO, "a new window starts at the renewal");
+        f.presented(t0 + MS * 1_800);
+        let (_, epoch) = f.left(t0 + MS * 1_800);
+        f.charge(epoch, MS * 100);
+        assert_eq!(f.left(t0 + MS * 2_700).0, Duration::ZERO, "a present starts a new window too");
+        assert_eq!(f.left(t0 + MS * 2_800).0, MS * 100);
+    }
+
+    fn wait_until_built(standin: usize) {
+        let start = Instant::now();
+        while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(MS * 5);
+        }
+    }
+
+    /// The first bind waits what is left of the frame's budget, the next ones of the frame do
+    /// not wait and go on without the pipeline, a renewed budget is waited from again, and the
+    /// build goes on (wanted) until a later bind gets the real pipeline.
+    #[test]
+    fn binds_wait_for_unbuilt_pipelines_no_longer_than_the_frame_budget_in_all() {
+        let (slow, other) = (0x7E57_F001usize, 0x7E57_F002usize);
+        let (go, finish) = mpsc::channel::<()>();
+        let (wanted_tx, wanted_rx) = mpsc::channel();
+        submit(slow, true, Box::new(move || {
+            let _ = finish.recv_timeout(Duration::from_secs(10));
+            let _ = wanted_tx.send(build_is_wanted());
+            0x6161
+        }));
+        let (go_other, finish_other) = mpsc::channel::<()>();
+        submit(other, true, Box::new(move || {
+            let _ = finish_other.recv_timeout(Duration::from_secs(10));
+            0x6262
+        }));
+        let f = budget(80, 60_000, FrameWaitKinds::Compute, Instant::now());
+        let t = Instant::now();
+        assert_eq!(resolve_wait_in(slow, None, Some(&f)), (slow, true), "not built within the budget: the stand-in, skipped");
+        let first = t.elapsed();
+        assert!(first >= MS * 70 && first < MS * 1_000, "waited {first:?}");
+        let t = Instant::now();
+        assert_eq!(resolve_wait_in(other, None, Some(&f)), (other, true));
+        assert_eq!(resolve_wait_in(slow, None, Some(&f)), (slow, true));
+        assert!(t.elapsed() < MS * 40, "the frame's budget is spent: no more waits ({:?})", t.elapsed());
+        f.presented(Instant::now());
+        let t = Instant::now();
+        assert_eq!(resolve_wait_in(slow, None, Some(&f)), (slow, true));
+        assert!(t.elapsed() >= MS * 70, "a new frame waits again ({:?})", t.elapsed());
+        go.send(()).unwrap();
+        go_other.send(()).unwrap();
+        assert!(wanted_rx.recv_timeout(Duration::from_secs(10)).unwrap(), "the build is still wanted after its binds went on");
+        wait_until_built(slow);
+        wait_until_built(other);
+        assert_eq!(resolve_wait_in(slow, None, Some(&f)), (0x6161, false), "built in the background: the real pipeline");
+        assert_eq!(resolve_wait_in(other, None, Some(&f)), (0x6262, false));
+        let _ = released(slow);
+        let _ = released(other);
+    }
+
+    /// A bind of a pipeline that is built within what is left of the budget gets it.
+    #[test]
+    fn a_pipeline_built_within_the_frame_budget_is_bound() {
+        let standin = 0x7E57_F003usize;
+        submit(standin, true, Box::new(|| {
+            std::thread::sleep(MS * 50);
+            0x6363
+        }));
+        let f = budget(5_000, 60_000, FrameWaitKinds::All, Instant::now());
+        assert_eq!(resolve_wait_in(standin, None, Some(&f)), (0x6363, false));
+        assert!(f.left(Instant::now()).0 < MS * 5_000, "the wait was charged");
+        let _ = released(standin);
+    }
+
+    /// A budget of the other kind leaves a bind as it was: it waits until its pipeline is built.
+    #[test]
+    fn a_frame_budget_for_graphics_does_not_bound_a_compute_bind() {
+        let standin = 0x7E57_F004usize;
+        submit(standin, true, Box::new(|| {
+            std::thread::sleep(MS * 200);
+            0x6464
+        }));
+        let f = budget(10, 60_000, FrameWaitKinds::Graphics, Instant::now());
+        assert_eq!(resolve_wait_in(standin, None, Some(&f)), (0x6464, false));
+        assert_eq!(f.left(Instant::now()).0, MS * 10, "nothing charged");
+        let _ = released(standin);
+    }
+
+    /// With `XCL_PSO_WAIT_MS` too, a bind waits the shorter of the two; only that per-pipeline
+    /// budget makes the pipeline late (not waited for again).
+    #[test]
+    fn the_shorter_of_the_frame_and_pipeline_budgets_bounds_a_bind() {
+        let standin = 0x7E57_F005usize;
+        let (go, finish) = mpsc::channel::<()>();
+        submit(standin, false, Box::new(move || {
+            let _ = finish.recv_timeout(Duration::from_secs(10));
+            0x6565
+        }));
+        let f = budget(5_000, 60_000, FrameWaitKinds::Graphics, Instant::now());
+        let t = Instant::now();
+        assert_eq!(resolve_wait_in(standin, Some(MS * 40), Some(&f)), (standin, true));
+        assert!(t.elapsed() < MS * 1_000, "the per-pipeline budget bounds it ({:?})", t.elapsed());
+        let t = Instant::now();
+        assert_eq!(resolve_wait_in(standin, Some(MS * 40), Some(&f)), (standin, true));
+        assert!(t.elapsed() < MS * 30, "late: not waited for again ({:?})", t.elapsed());
+        go.send(()).unwrap();
+        wait_until_built(standin);
+        assert_eq!(resolve_wait_in(standin, Some(MS * 40), Some(&f)), (0x6565, false));
+        let _ = released(standin);
+    }
+}
+
 fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
@@ -650,21 +832,43 @@ pub fn resolve(pso: usize) -> usize {
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
+    resolve_wait_checked(pso).0
+}
+
+/// `resolve_wait`, and whether the frame's wait budget (`XCL_PSO_FRAME_WAIT_MS`) ran out
+/// before the pipeline was built: the result is then the stand-in, and the draw or dispatch
+/// that binds it is to be skipped (`note_skipped_draw` / `note_skipped_dispatch`). Always false
+/// without that budget.
+pub fn resolve_wait_checked(pso: usize) -> (usize, bool) {
+    resolve_wait_in(pso, wait_budget(), frame_budget())
 }
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
+#[cfg(test)]
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+    resolve_wait_in(pso, budget, None).0
+}
+
+/// `resolve_wait_for`, within what is left of `frame` for a pipeline of the kinds it covers.
+fn resolve_wait_in(pso: usize, budget: Option<std::time::Duration>, frame: Option<&FrameBudget>) -> (usize, bool) {
+    let Some(p) = entry(pso) else { return (pso, false) };
     p.note_use();
+    if let Some(frame) = frame.filter(|f| f.kinds.covers(p.compute)) {
+        return resolve_within_frame(&p, pso, budget, frame);
+    }
+    (resolve_wait_unbudgeted(&p, pso, budget), false)
+}
+
+/// `resolve_wait_for` of a pipeline the frame budget does not cover (as before it existed).
+fn resolve_wait_unbudgeted(p: &Arc<Pending>, pso: usize, budget: Option<std::time::Duration>) -> usize {
     // (the title's thread is held from here until the pipeline is built or the budget is over)
     let _held = (!*p.done.lock().unwrap()).then(Held::new);
     if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
+        return resolve_within(p, pso, budget);
     }
     p.want();
     if p.job.lock().unwrap().is_some() {
-        build_for_waiting_thread(&p);
+        build_for_waiting_thread(p);
     }
     let mut done = p.done.lock().unwrap();
     while !*done {
@@ -742,6 +946,304 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
     }
     pso
+}
+
+/// Which binds the frame's wait budget covers (`XCL_PSO_FRAME_WAIT_KINDS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameWaitKinds {
+    Compute,
+    Graphics,
+    All,
+}
+
+impl FrameWaitKinds {
+    fn parse(text: &str) -> Option<FrameWaitKinds> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "compute" => Some(FrameWaitKinds::Compute),
+            "graphics" => Some(FrameWaitKinds::Graphics),
+            "all" => Some(FrameWaitKinds::All),
+            _ => None,
+        }
+    }
+
+    fn covers(self, compute: bool) -> bool {
+        match self {
+            FrameWaitKinds::Compute => compute,
+            FrameWaitKinds::Graphics => !compute,
+            FrameWaitKinds::All => true,
+        }
+    }
+}
+
+/// Experimental (`XCL_PSO_FRAME_WAIT_MS`): how long the binds of one frame may wait in all for
+/// pipelines still being built. A retail title's world load binds a long chain of compute
+/// pipelines the driver takes 2 – 30 s each to build; waiting for each one stops the title
+/// presenting for minutes. With this budget a bind waits at most for what is left of it; once it
+/// is spent, a bind goes on with the stand-in and its draw or dispatch is skipped, while the
+/// build goes on in the background (wanted, at a normal priority) for a later frame.
+///
+/// The budget is new at each `PresentX`, and also after `window` of wall time since it was last
+/// new: during the stall nothing is presented, and without that the binds would never wait
+/// again (or never be bounded).
+///
+/// Waits are charged after they end, so binds on several threads at once may wait more than the
+/// budget in all (each waits at most what was left when it began).
+pub struct FrameBudget {
+    limit: std::time::Duration,
+    window: std::time::Duration,
+    kinds: FrameWaitKinds,
+    spend: Mutex<FrameSpend>,
+}
+
+struct FrameSpend {
+    /// when the budget was last new
+    since: std::time::Instant,
+    /// bumped at each renewal: a wait that began before it is not charged to the new frame
+    epoch: u64,
+    spent: std::time::Duration,
+}
+
+/// Why the frame budget was last new.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Renewal {
+    Present,
+    Window,
+}
+
+const FRAME_WAIT_MS_VAR: &str = "XCL_PSO_FRAME_WAIT_MS";
+const FRAME_WAIT_WINDOW_MS_VAR: &str = "XCL_PSO_FRAME_WAIT_WINDOW_MS";
+const FRAME_WAIT_KINDS_VAR: &str = "XCL_PSO_FRAME_WAIT_KINDS";
+
+impl FrameBudget {
+    /// The budget the three variables' values describe (None: `XCL_PSO_FRAME_WAIT_MS` unset or 0).
+    fn parse(ms: Option<&str>, window_ms: Option<&str>, kinds: Option<&str>, now: std::time::Instant) -> Result<Option<FrameBudget>, String> {
+        let Some(ms) = ms.map(str::trim).filter(|v| !v.is_empty()) else { return Ok(None) };
+        let ms: u64 = ms.parse().map_err(|_| format!("{FRAME_WAIT_MS_VAR}={ms:?} is not a whole number of milliseconds"))?;
+        if ms == 0 {
+            return Ok(None);
+        }
+        let window = window_ms
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("{FRAME_WAIT_MS_VAR} is set, so {FRAME_WAIT_WINDOW_MS_VAR} (the wall time in ms after which the budget is new without a present) must be set too"))?;
+        let window: u64 = window
+            .parse()
+            .ok()
+            .filter(|&w| w > 0)
+            .ok_or_else(|| format!("{FRAME_WAIT_WINDOW_MS_VAR}={window:?} must be a whole number of milliseconds above 0"))?;
+        let kinds = kinds
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("{FRAME_WAIT_MS_VAR} is set, so {FRAME_WAIT_KINDS_VAR} (compute, graphics or all) must be set too"))?;
+        let kinds = FrameWaitKinds::parse(kinds).ok_or_else(|| format!("{FRAME_WAIT_KINDS_VAR}={kinds:?} must be compute, graphics or all"))?;
+        Ok(Some(FrameBudget::new(std::time::Duration::from_millis(ms), std::time::Duration::from_millis(window), kinds, now)))
+    }
+
+    fn new(limit: std::time::Duration, window: std::time::Duration, kinds: FrameWaitKinds, now: std::time::Instant) -> FrameBudget {
+        FrameBudget { limit, window, kinds, spend: Mutex::new(FrameSpend { since: now, epoch: 0, spent: std::time::Duration::ZERO }) }
+    }
+
+    fn renew(s: &mut FrameSpend, now: std::time::Instant, why: Renewal) {
+        s.since = now;
+        s.epoch += 1;
+        s.spent = std::time::Duration::ZERO;
+        match why {
+            Renewal::Present => FRAME_STATS.renewed_by_present.fetch_add(1, Ordering::Relaxed),
+            Renewal::Window => FRAME_STATS.renewed_by_window.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    /// What is left of the budget now, and the epoch to charge a wait to (`charge`).
+    fn left(&self, now: std::time::Instant) -> (std::time::Duration, u64) {
+        let mut s = self.spend.lock().unwrap();
+        if now.saturating_duration_since(s.since) >= self.window {
+            FrameBudget::renew(&mut s, now, Renewal::Window);
+        }
+        (self.limit.saturating_sub(s.spent), s.epoch)
+    }
+
+    /// A bind waited `waited` from `epoch` on (not charged once the budget has been renewed since).
+    fn charge(&self, epoch: u64, waited: std::time::Duration) {
+        let mut s = self.spend.lock().unwrap();
+        if s.epoch == epoch {
+            s.spent = s.spent.saturating_add(waited);
+        }
+    }
+
+    /// The title presented a frame: the budget is new.
+    fn presented(&self, now: std::time::Instant) {
+        FrameBudget::renew(&mut self.spend.lock().unwrap(), now, Renewal::Present);
+    }
+}
+
+/// What the frame budget did, for the log line every `FRAME_STATS_PERIOD`.
+struct FrameStats {
+    /// binds that waited for a build (within the budget)
+    waits: std::sync::atomic::AtomicU64,
+    waited_us: std::sync::atomic::AtomicU64,
+    /// binds that went on with the stand-in: the budget was spent
+    gave_up_compute: std::sync::atomic::AtomicU64,
+    gave_up_graphics: std::sync::atomic::AtomicU64,
+    draws_skipped: std::sync::atomic::AtomicU64,
+    dispatches_skipped: std::sync::atomic::AtomicU64,
+    renewed_by_present: std::sync::atomic::AtomicU64,
+    renewed_by_window: std::sync::atomic::AtomicU64,
+}
+
+static FRAME_STATS: FrameStats = FrameStats {
+    waits: std::sync::atomic::AtomicU64::new(0),
+    waited_us: std::sync::atomic::AtomicU64::new(0),
+    gave_up_compute: std::sync::atomic::AtomicU64::new(0),
+    gave_up_graphics: std::sync::atomic::AtomicU64::new(0),
+    draws_skipped: std::sync::atomic::AtomicU64::new(0),
+    dispatches_skipped: std::sync::atomic::AtomicU64::new(0),
+    renewed_by_present: std::sync::atomic::AtomicU64::new(0),
+    renewed_by_window: std::sync::atomic::AtomicU64::new(0),
+};
+
+impl FrameStats {
+    fn snapshot(&self) -> [u64; 8] {
+        [
+            self.waits.load(Ordering::Relaxed),
+            self.waited_us.load(Ordering::Relaxed),
+            self.gave_up_compute.load(Ordering::Relaxed),
+            self.gave_up_graphics.load(Ordering::Relaxed),
+            self.draws_skipped.load(Ordering::Relaxed),
+            self.dispatches_skipped.load(Ordering::Relaxed),
+            self.renewed_by_present.load(Ordering::Relaxed),
+            self.renewed_by_window.load(Ordering::Relaxed),
+        ]
+    }
+}
+
+const FRAME_STATS_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The frame budget from the environment (None: off). Panics on a malformed setting: it is read
+/// first by `check_frame_budget`, when the D3D12 backend starts.
+fn frame_budget() -> Option<&'static FrameBudget> {
+    static F: OnceLock<Option<FrameBudget>> = OnceLock::new();
+    F.get_or_init(|| {
+        let var = |name: &str| std::env::var(name).ok();
+        match FrameBudget::parse(var(FRAME_WAIT_MS_VAR).as_deref(), var(FRAME_WAIT_WINDOW_MS_VAR).as_deref(), var(FRAME_WAIT_KINDS_VAR).as_deref(), std::time::Instant::now()) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::xlog_error!("D3D12.X: {e}");
+                panic!("D3D12.X: {e}");
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Reads the frame budget's settings (a malformed one ends the process here, not at a bind
+/// minutes later) and, when it is on, logs it and starts its log line every 2 s.
+pub fn check_frame_budget() {
+    let Some(f) = frame_budget() else { return };
+    crate::xlog_info!(
+        "D3D12.X: experimental frame wait budget: binds of {:?} pipelines still being built wait at most {} ms per frame in all (new at each PresentX, or after {} ms without one); past it their draws and dispatches are skipped",
+        f.kinds,
+        f.limit.as_millis(),
+        f.window.as_millis()
+    );
+    let _ = std::thread::Builder::new().name("xcl-pso-frame-wait".into()).spawn(|| {
+        let mut last = FRAME_STATS.snapshot();
+        loop {
+            std::thread::sleep(FRAME_STATS_PERIOD);
+            let now = FRAME_STATS.snapshot();
+            if now == last {
+                continue;
+            }
+            let d: Vec<u64> = now.iter().zip(last.iter()).map(|(a, b)| a - b).collect();
+            crate::xlog_info!(
+                "D3D12.X: frame wait budget, last 2 s: {} binds waited {} ms in all; {} compute / {} graphics binds went on without their pipeline; {} draws, {} dispatches skipped; renewed {} times by PresentX, {} by the window (totals: {} waits, {} ms, {} draws, {} dispatches skipped)",
+                d[0],
+                d[1] / 1000,
+                d[2],
+                d[3],
+                d[4],
+                d[5],
+                d[6],
+                d[7],
+                now[0],
+                now[1] / 1000,
+                now[4],
+                now[5]
+            );
+            last = now;
+        }
+    });
+}
+
+/// The title presented a frame (`PresentX`): the frame budget is new.
+pub fn frame_presented() {
+    if let Some(f) = frame_budget() {
+        f.presented(std::time::Instant::now());
+    }
+}
+
+/// A draw was skipped because the frame budget ran out before its pipeline was built.
+pub fn note_skipped_draw() {
+    FRAME_STATS.draws_skipped.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A dispatch was skipped because the frame budget ran out before its pipeline was built.
+pub fn note_skipped_dispatch() {
+    FRAME_STATS.dispatches_skipped.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `resolve_wait` of a pipeline `frame` covers: the build goes to the workers (never to this
+/// thread: a build here cannot be bounded) and is wanted; the bind waits at most what is left of
+/// the frame's budget (and of `per_pipeline`, `XCL_PSO_WAIT_MS`). True: not built by then – the
+/// stand-in. Only `per_pipeline` running out makes the pipeline `late`; the frame budget does
+/// not, so the next frame's binds wait for it again.
+fn resolve_within_frame(p: &Arc<Pending>, pso: usize, per_pipeline: Option<std::time::Duration>, frame: &FrameBudget) -> (usize, bool) {
+    let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
+        0 => pso,
+        r => r,
+    };
+    if *p.done.lock().unwrap() {
+        return (built(p), false);
+    }
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        let _ = queue().lock().unwrap().send(p.clone());
+    }
+    p.want();
+    let gave_up = || {
+        if p.compute {
+            FRAME_STATS.gave_up_compute.fetch_add(1, Ordering::Relaxed);
+        } else {
+            FRAME_STATS.gave_up_graphics.fetch_add(1, Ordering::Relaxed);
+        }
+        (pso, true)
+    };
+    if p.late.load(Ordering::Acquire) {
+        return gave_up();
+    }
+    let (left, epoch) = frame.left(std::time::Instant::now());
+    let (wait, per_pipeline_bounds) = match per_pipeline {
+        Some(b) if b <= left => (b, true),
+        _ => (left, false),
+    };
+    if wait.is_zero() {
+        return gave_up();
+    }
+    let start = std::time::Instant::now();
+    let finished = {
+        let _held = Held::new();
+        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), wait, |d| !*d).unwrap();
+        *done
+    };
+    let waited = start.elapsed();
+    frame.charge(epoch, waited);
+    FRAME_STATS.waits.fetch_add(1, Ordering::Relaxed);
+    FRAME_STATS.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+    if finished {
+        return (built(p), false);
+    }
+    if per_pipeline_bounds {
+        p.late.store(true, Ordering::Release);
+    }
+    gave_up()
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.

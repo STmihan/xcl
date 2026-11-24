@@ -253,7 +253,7 @@ fn signature_dispatches(sig: usize) -> bool {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let (pso, unbuilt) = super::pso_async::resolve_wait_checked(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
@@ -262,7 +262,16 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(with(this, |s| s.pso)) {
+        // (also when the frame's pipeline wait budget ran out: `XCL_PSO_FRAME_WAIT_MS`; the
+        // build may have ended since, and the stand-in must not reach the PC call)
+        if unbuilt || super::pso_async::is_pending(with(this, |s| s.pso)) {
+            if unbuilt {
+                if signature_dispatches(sig) {
+                    super::pso_async::note_skipped_dispatch();
+                } else {
+                    super::pso_async::note_skipped_draw();
+                }
+            }
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -496,7 +505,15 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    let (resolved, unbuilt) = super::pso_async::resolve_wait_checked(pso);
+    // the frame's pipeline wait budget ran out before it was built (`XCL_PSO_FRAME_WAIT_MS`):
+    // skipped, not drawn with the stand-in
+    if unbuilt {
+        count(DRAWS_SKIPPED);
+        super::pso_async::note_skipped_draw();
+        return None;
+    }
+    if !super::real::is_translated_graphics(resolved) {
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
@@ -801,9 +818,13 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let (pso, unbuilt) = super::pso_async::resolve_wait_checked(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
+        // (the frame's pipeline wait budget ran out before it was built: `XCL_PSO_FRAME_WAIT_MS`)
+        if unbuilt {
+            super::pso_async::note_skipped_dispatch();
+        }
         // a console pipeline without a translation (including a background build that
         // failed): nothing to run (its root arguments were not given to the PC list either)
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
