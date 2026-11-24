@@ -477,6 +477,32 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
+/// HLSL larger than this compiles at -O0: a safety net for sources far larger than any program
+/// measured, not a level a known program is meant to get. It was 8 MiB at first; the six largest
+/// compute programs of one retail pack (~17 000 console instructions, 13–30 MB of HLSL then) fell
+/// under it, and their -O0 DXIL was more than NVIDIA's compiler could take (the numbers in
+/// `compile_here`). The owner's decision since: those programs compile at -O1. The limit is
+/// therefore deliberately *not* rescaled when the emitter makes the text smaller (comments,
+/// indentation, temporaries, SCC writes and selects have gone since: every program only moved
+/// further below it) – in every form (split wave64, four memory windows, `XCL_RECOMP_COMMENTS`)
+/// the giants stay at -O1. docs/code/recompiler-hlsl-size.md.
+const UNOPTIMISED_ABOVE_HLSL_BYTES: usize = 64 * 1024 * 1024;
+/// HLSL larger than this compiles at -O1 (was 1 MiB, rescaled the same way: every program that
+/// had -O1 keeps it).
+const LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES: usize = 520_000;
+
+/// The DXC optimisation level for a source of this size when the caller names none (`None`:
+/// DXC's default, -O3).
+fn optimisation_level_for(hlsl_bytes: usize) -> Option<&'static str> {
+    if hlsl_bytes > UNOPTIMISED_ABOVE_HLSL_BYTES {
+        Some("-O0")
+    } else if hlsl_bytes > LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES {
+        Some("-O1")
+    } else {
+        None
+    }
+}
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
@@ -485,17 +511,16 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
     // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
     // compile). -O0 only as a safety net for enormous sources.
-    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
+    // -O1 for large sources (from 1 MB on when measured, `LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES`
+    // now): the same DXIL size at a quarter less time (a retail game's then 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     // -O1 up to 64 MB, not 8: a retail game's six largest CS (13–30 MB of HLSL, ~17 000
     // instructions) got 2.3× their DXIL at -O0 (21.3 MB vs 9.2 MB for a 29.6 MB source; DXC
     // 1.9 at -O1: 232 s, 3.2 GB peak), and NVIDIA's compiler went past 50 GB of commit on the
     // -O0 DXIL without finishing.
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 64 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
-        } else if src.len() > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
+        if let Some(level) = optimisation_level_for(src.len()) {
+            args.push(crate::util::wide(level));
         }
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
@@ -1251,5 +1276,19 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod optimisation_level_tests {
+    use super::*;
+
+    #[test]
+    fn level_follows_the_source_size() {
+        assert_eq!(optimisation_level_for(0), None);
+        assert_eq!(optimisation_level_for(LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES), None);
+        assert_eq!(optimisation_level_for(LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES + 1), Some("-O1"));
+        assert_eq!(optimisation_level_for(UNOPTIMISED_ABOVE_HLSL_BYTES), Some("-O1"));
+        assert_eq!(optimisation_level_for(UNOPTIMISED_ABOVE_HLSL_BYTES + 1), Some("-O0"));
     }
 }

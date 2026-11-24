@@ -466,7 +466,7 @@ unknown records), the result read with `bvh::Bvh::trace` = brute force on 500 ra
   still behind an `if`), VGPR write `v = select(active, value, v)`, the VALU path without a named temporary variable.
   Effect on the builder's shaders: 15 720 instructions – DXC `-O3` 5.8 s, 585 KB DXIL (before: > 150 s / driver:
   out of memory); the shader from yesterday's crash (1 589 instr.) – 0.3 s, 48 KB (before: ~6 min and > 30 GB).
-  **DXC optimizes everything again** (`-O0` only for > 8 MB of HLSL). A sample of 64 game shaders: 0 errors; median 0.29 s, p90 ~11 s.
+  **DXC optimizes everything again** (`-O0` only for > 8 MB of HLSL; since 2026-11-24 > 3.94 MB, the HLSL lost its comments and indentation: `docs/code/recompiler-hlsl-size.md`). A sample of 64 game shaders: 0 errors; median 0.29 s, p90 ~11 s.
 
 ### FSR4 for learning about textures (session 5, in progress)
 - Probe `fsr4_console_upscaler_creates_a_context_probe` (`XCL_PROBE_FSR=1`): `ffxCreateContext` with
@@ -1772,7 +1772,7 @@ to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Wins
   memory outside unified memory are done by the CPU after the queue's work (`cpu_writes.rs`), waits there read it on
   the CPU; compute pipelines of 256 KB of DXIL or more are built in the background (the driver takes ~30 s for
   its 1 MB ray-tracing resolve programs; 2 at a time, within `wait_for_memory`), and a bind of one not started
-  builds it itself (`pso_async`); DXC -O1 from 1 MB of HLSL; `xcl shaders --precompile --pipelines` makes the
+  builds it itself (`pso_async`); DXC -O1 from 1 MB of HLSL (520 KB since 2026-11-24, `docs/code/recompiler-hlsl-size.md`); `xcl shaders --precompile --pipelines` makes the
   compute pipelines on the GPU too (the driver's cache: 41.6 s then 0.2 s; 4 at a time, `XCL_PIPELINE_THREADS`);
   `XCL_TRACE_FRAME_EVENTS`; the end of a timed run logs the PresentX calls.
 - Measured: the memory-window `switch` of every memory access doubles DXC + driver time (one 21 000-instruction CS:

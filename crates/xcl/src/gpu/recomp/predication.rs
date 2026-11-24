@@ -3,7 +3,8 @@
 //! The emitter writes a VALU result as `v = select(lane active, value, v)`: lanes outside EXEC
 //! keep their old value, as on the console. Most of those selects guard nothing – the mask is
 //! full, or the lanes outside it never look at the register again before it is rewritten – and
-//! on the largest retail programs (compiled at -O0) every one of them reaches the driver. This
+//! on the largest retail programs (compiled at -O0 when this was measured; at -O1 since,
+//! `dxc::optimisation_level_for`) every one of them reaches the driver. This
 //! module finds the writes whose select can go, without changing what any lane can observe.
 //!
 //! It works on what the emitter *wrote*, not on the operand tables: a first emission records,

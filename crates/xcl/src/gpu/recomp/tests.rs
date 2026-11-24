@@ -6871,9 +6871,9 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     if (lane_id == 0u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x7BFFu), f16tof32(0x3C01u), f16tof32(0xFBFFu), 0u), 0u);\n\
     if (lane_id == 1u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x7BFFu), f16tof32(0x3C01u), f16tof32(0xFBFFu), 3u), 3u);\n\
     if (lane_id == 2u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x3C01u), f16tof32(0x3C01u), f16tof32(0xBC02u), 0u), 0u);\n";
-    let marker = "    v0 = select((((exec_lo >> lane_id) & 1u) != 0u), (v0), v0);\n";
-    assert!(hlsl.contains(marker), "unexpected kernel body:\n{hlsl}");
-    hlsl = hlsl.replace(marker, probe);
+    let marker = format!("{}v0 = select((((exec_lo >> lane_id) & 1u) != 0u), (v0), v0);\n", super::emit::INDENT);
+    assert!(hlsl.contains(&marker), "unexpected kernel body:\n{hlsl}");
+    hlsl = hlsl.replace(&marker, probe);
 
     let dxil = super::dxc::compile(&hlsl, "main", "cs_6_6", &[]).unwrap();
     let mut st = KernelState::default();
@@ -7710,7 +7710,7 @@ fn scc_liveness_rules_match_what_the_emitter_reads_and_writes() {
         let d = crate::gpu::rdna2::decode(&bytes, 0).unwrap();
         let mut code = bytes.clone();
         code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
-        let t = translate(&code, &Options::default()).unwrap();
+        let t = translate(&code, &Options { source_comments: true, ..Options::default() }).unwrap();
         let statements: Vec<&str> = t
             .hlsl
             .lines()
@@ -7751,4 +7751,204 @@ fn gpu_dropped_scc_writes_leave_the_results_unchanged() {
     let r = runner::run_code(&code, &st, &[]).unwrap();
     assert_eq!((r.sgpr[2], r.sgpr[3], r.sgpr[4], r.sgpr[5], r.sgpr[6], r.sgpr[7]), (1, 1, 1, 0, 7, 0));
     assert_eq!(r.scc, 0);
+}
+
+#[test]
+fn scalar_results_are_written_without_single_use_temporaries() {
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 255)], Some(0x1234_5678)),
+        ("S_AND_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 4)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 8)], None),
+        ("S_XOR_B64", "ENC_SOP2", &[("SDST", 14), ("SSRC0", 14), ("SSRC1", 16)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 22)], None),
+        ("S_ANDN1_WREXEC_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 26)], None),
+    ]);
+    let hlsl = translate(&code, &Options::default()).unwrap().hlsl;
+    for expected in [
+        "s0 = 0x12345678u;",
+        "s3 = s3 & s4;",
+        "s6 = s8; s7 = s9;",
+        "s14 = s14 ^ s16; s15 = s15 ^ s17;",
+        "s20 = exec_lo; s21 = exec_hi;",
+        "exec_lo = s22 & exec_lo; exec_hi = s23 & exec_hi;",
+        "exec_lo = ~s26 & exec_lo; exec_hi = ~s27 & exec_hi;",
+        "s24 = exec_lo; s25 = exec_hi;",
+    ] {
+        assert!(hlsl.contains(expected), "missing `{expected}`:\n{hlsl}");
+    }
+    let body = &hlsl[hlsl.find("s0 = 0x12345678u;").unwrap()..];
+    assert!(!body.contains("uint t"), "{body}");
+    // only the last SCC write is read (by the kernel's end): the others are left out (`scc_liveness`)
+    assert_eq!(body.matches("scc = ").count(), 1, "{body}");
+    assert!(body.contains("scc = (uint)((exec_lo | exec_hi) != 0u);"), "{body}");
+}
+
+/// An SCC that is read is computed from the register the result went to.
+#[test]
+fn a_read_scc_is_computed_from_the_destination_register() {
+    let and32 = prog(&[("S_AND_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 4)], None)]);
+    let hlsl = translate(&and32, &Options::default()).unwrap().hlsl;
+    assert!(hlsl.contains("s3 = s3 & s4;") && hlsl.contains("scc = (uint)(s3 != 0u);"), "{hlsl}");
+    let xor64 = prog(&[("S_XOR_B64", "ENC_SOP2", &[("SDST", 14), ("SSRC0", 14), ("SSRC1", 16)], None)]);
+    let hlsl = translate(&xor64, &Options::default()).unwrap().hlsl;
+    assert!(hlsl.contains("s14 = s14 ^ s16; s15 = s15 ^ s17;") && hlsl.contains("scc = (uint)((s14 | s15) != 0u);"), "{hlsl}");
+}
+
+/// A carry nothing reads is not written (`scc_liveness`), so it does not keep the temporary its
+/// condition would need either; a destination without a register then leaves nothing at all.
+#[test]
+fn a_dead_scc_write_does_not_keep_a_temporary() {
+    const NULL_SGPR: u64 = 125;
+    let code = prog(&[
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 1)], None),
+        ("S_AND_B32", "ENC_SOP2", &[("SDST", NULL_SGPR), ("SSRC0", 5), ("SSRC1", 6)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 3)], None),
+    ]);
+    let hlsl = translate(&code, &Options::default()).unwrap().hlsl;
+    let body = &hlsl[hlsl.find("s0 = s0 + s1;").unwrap_or_else(|| panic!("{hlsl}"))..];
+    assert!(!body.contains("uint t") && !body.contains("s5 & s6"), "{body}");
+    assert_eq!(body.matches("scc = ").count(), 1, "{body}");
+    if !gpu_ready() {
+        return;
+    }
+    let mut st = KernelState::default();
+    (st.sgpr[0], st.sgpr[1], st.sgpr[2], st.sgpr[3]) = (0xFFFF_FFFF, 2, 7, 7);
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!((r.sgpr[0], r.scc), (1, 1));
+}
+
+#[test]
+fn scalar_results_keep_a_temporary_when_the_destination_is_still_read() {
+    let carry_reads_destination = prog(&[("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 1)], None)]);
+    let hlsl = translate(&carry_reads_destination, &Options::default()).unwrap().hlsl;
+    assert!(hlsl.contains("uint t1 = s0 + s1;") && hlsl.contains("scc = (uint)(t1 < s0);") && hlsl.contains("s0 = t1;"), "{hlsl}");
+
+    let overlapping_pair = prog(&[("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 7)], None)]);
+    let hlsl = translate(&overlapping_pair, &Options::default()).unwrap().hlsl;
+    assert!(hlsl.contains("= s7; uint ") && !hlsl.contains("s8 = s7; s9 = s8;"), "{hlsl}");
+
+    let saved_exec_overwrites_the_source = prog(&[("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 30)], None)]);
+    let hlsl = translate(&saved_exec_overwrites_the_source, &Options::default()).unwrap().hlsl;
+    let saved = hlsl.find("= exec_lo; uint ").expect("old exec saved first");
+    let narrowed = hlsl.find("exec_lo = s30 & exec_lo; exec_hi = s31 & exec_hi;").expect("exec narrowed from the source");
+    assert!(saved < narrowed, "{hlsl}");
+}
+
+#[test]
+fn scalar_moves_onto_themselves_emit_nothing() {
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 9)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 10)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    for absent in ["s9 = s9", "s10 = s10", "s11 = s11"] {
+        assert!(!t.hlsl.contains(absent), "unexpected `{absent}`:
+{}", t.hlsl);
+    }
+}
+
+#[test]
+fn source_comments_are_opt_in_and_effect_free_instructions_emit_nothing() {
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 129)], None),
+        ("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ("S_WAITCNT", "ENC_SOPP", &[("SIMM16", 0)], None),
+    ]);
+    let plain = translate(&code, &Options::default()).unwrap();
+    assert!(plain.complete(), "{:?}", plain.unsupported_why);
+    for absent in ["s_nop", "s_waitcnt", "s_mov_b32"] {
+        assert!(!plain.hlsl.contains(absent), "unexpected `{absent}`:
+{}", plain.hlsl);
+    }
+    let commented = translate(&code, &Options { source_comments: true, ..Options::default() }).unwrap().hlsl;
+    for listed in ["// 0000: s_mov_b32", "s_nop", "s_waitcnt"] {
+        assert!(commented.contains(listed), "missing `{listed}`:
+{commented}");
+    }
+    let without_comments: String = commented.lines().filter(|l| !l.trim_start().starts_with("// 00")).map(|l| format!("{l}
+")).collect();
+    assert_eq!(without_comments, plain.hlsl);
+}
+
+#[test]
+fn nested_blocks_indent_by_one_step() {
+    let code = prog(&[
+        ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 129)], None),
+    ]);
+    let hlsl = translate(&code, &Options::default()).unwrap().hlsl;
+    let step = super::emit::INDENT;
+    let block_start = format!("\n{step}if (!(scc == 0u)) {{\n");
+    let opened = hlsl.find(&block_start).expect("block one step deep");
+    let body = &hlsl[opened + block_start.len()..];
+    assert!(body.starts_with(&step.repeat(2)) && !body.starts_with(&step.repeat(3)), "{hlsl}");
+    assert!(body.contains(&format!(";\n{step}}}\n")), "{hlsl}");
+}
+
+#[test]
+fn gpu_scalar_results_written_in_place_keep_aliased_operands_and_scc() {
+    if !gpu_ready() {
+        return;
+    }
+    let pick_scc = |dst: u64| ("S_CSELECT_B32", "ENC_SOP2", vec![("SDST", dst), ("SSRC0", 135), ("SSRC1", 136)], None);
+    let steps: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_ADD_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 0), ("SSRC1", 1)], None),
+        pick_scc(50),
+        ("S_AND_B32", "ENC_SOP2", vec![("SDST", 3), ("SSRC0", 3), ("SSRC1", 4)], None),
+        pick_scc(51),
+        ("S_SUB_U32", "ENC_SOP2", vec![("SDST", 5), ("SSRC0", 6), ("SSRC1", 5)], None),
+        pick_scc(52),
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 8), ("SSRC0", 7)], None),
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 10), ("SSRC0", 11)], None),
+        ("S_XOR_B64", "ENC_SOP2", vec![("SDST", 14), ("SSRC0", 14), ("SSRC1", 16)], None),
+        pick_scc(53),
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 18), ("SSRC0", 18)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", vec![("SDST", 30), ("SSRC0", 30)], None),
+        pick_scc(54),
+        ("S_OR_SAVEEXEC_B64", "ENC_SOP1", vec![("SDST", 32), ("SSRC0", 34)], None),
+        ("S_ANDN1_WREXEC_B64", "ENC_SOP1", vec![("SDST", 36), ("SSRC0", 38)], None),
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 30)], None),
+    ];
+    let borrowed: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = steps.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+    let code = prog(&borrowed);
+    let mut st = KernelState::default();
+    for (register, value) in [
+        (0, 0xFFFF_FFFF),
+        (1, 2),
+        (3, 0xF0),
+        (4, 0x0F),
+        (5, 2),
+        (6, 1),
+        (7, 0x11),
+        (8, 0x22),
+        (9, 0x99),
+        (11, 0x33),
+        (12, 0x44),
+        (14, 1),
+        (15, 2),
+        (16, 1),
+        (17, 2),
+        (18, 0x55),
+        (19, 0x66),
+        (30, 0x0000_FFFF),
+        (31, 0),
+        (34, 0x000F_0000),
+        (35, 0),
+        (38, 0xF),
+        (39, 0),
+    ] {
+        st.sgpr[register] = value;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!((r.sgpr[0], r.sgpr[50]), (1, 7), "s_add_u32 into its first source carries");
+    assert_eq!((r.sgpr[3], r.sgpr[51]), (0, 8), "s_and_b32 into its first source, zero result");
+    assert_eq!((r.sgpr[5], r.sgpr[52]), (0xFFFF_FFFF, 7), "s_sub_u32 into its second source borrows");
+    assert_eq!((r.sgpr[8], r.sgpr[9]), (0x11, 0x22), "s_mov_b64 one register up");
+    assert_eq!((r.sgpr[10], r.sgpr[11]), (0x33, 0x44), "s_mov_b64 one register down");
+    assert_eq!((r.sgpr[14], r.sgpr[15], r.sgpr[53]), (0, 0, 8), "s_xor_b64 into its first source, zero result");
+    assert_eq!((r.sgpr[18], r.sgpr[19]), (0x55, 0x66), "s_mov_b64 onto itself");
+    assert_eq!((r.sgpr[30], r.sgpr[31], r.sgpr[54]), (0xFFFF_FFFF, 0xFFFF_FFFF, 7), "s_and_saveexec_b64 over its source keeps the old exec");
+    assert_eq!((r.sgpr[32], r.sgpr[33]), (0x0000_FFFF, 0), "s_or_saveexec_b64 saves the narrowed exec");
+    assert_eq!((r.sgpr[36], r.sgpr[37]), (0x000F_FFF0, 0), "s_andn1_wrexec_b64 returns the new exec");
 }
