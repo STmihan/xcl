@@ -204,7 +204,7 @@ impl Trace {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct Plan {
     exec_covers_every_lane: BTreeSet<u64>,
     unpredicated: BTreeSet<(u64, u64)>,
