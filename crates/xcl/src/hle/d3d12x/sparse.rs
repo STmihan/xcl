@@ -1450,6 +1450,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
+    s.forget_deferred_buffers();
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
         s.retire_free_pools();
@@ -1569,22 +1570,47 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
+    s.forget_deferred_buffers();
     s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
     s.signal();
     Some((hr, delta))
 }
 
+static DEFERRED_FORGETS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
 /// A placed buffer is gone: its tiles are not pinned by it any more.
 pub fn forget_buffer(res: usize) {
-    let mut g = STATE.lock().unwrap();
+    let mut g = match STATE.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            DEFERRED_FORGETS.lock().unwrap().push(res);
+            return;
+        }
+        Err(std::sync::TryLockError::Poisoned(e)) => panic!("sparse state poisoned: {e}"),
+    };
     let Some(s) = g.as_mut() else { return };
-    let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+    s.forget_deferred_buffers();
+    s.forget_buffer_locked(res);
+}
+
+impl State {
+    fn forget_deferred_buffers(&mut self) {
+        let deferred = std::mem::take(&mut *DEFERRED_FORGETS.lock().unwrap());
+        for res in deferred {
+            self.forget_buffer_locked(res);
+        }
+    }
+
+    fn forget_buffer_locked(&mut self, res: usize) {
+        let s = self;
+        let Some(tiles) = s.buffers.remove(&res) else { return };
+        for tile in tiles {
+            if let Some(c) = s.pinned.get_mut(&tile) {
+                *c -= 1;
+                if *c == 0 {
+                    s.pinned.remove(&tile);
+                    s.release_if_unused(tile);
+                }
             }
         }
     }
