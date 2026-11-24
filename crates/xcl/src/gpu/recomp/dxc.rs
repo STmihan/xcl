@@ -487,8 +487,12 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // compile). -O0 only as a safety net for enormous sources.
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
+    // -O1 up to 64 MB, not 8: a retail game's six largest CS (13–30 MB of HLSL, ~17 000
+    // instructions) got 2.3× their DXIL at -O0 (21.3 MB vs 9.2 MB for a 29.6 MB source; DXC
+    // 1.9 at -O1: 232 s, 3.2 GB peak), and NVIDIA's compiler went past 50 GB of commit on the
+    // -O0 DXIL without finishing.
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
+        if src.len() > 64 * 1024 * 1024 {
             args.push(crate::util::wide("-O0"));
         } else if src.len() > 1024 * 1024 {
             args.push(crate::util::wide("-O1"));
