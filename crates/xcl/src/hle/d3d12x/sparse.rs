@@ -564,6 +564,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
+            *SPARSE_QUEUE.lock().unwrap() = Some(s.queue.clone());
             let old = STATE.lock().unwrap().replace(s);
             drop(old);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
@@ -1217,8 +1218,10 @@ pub unsafe fn free(p: usize) -> bool {
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes.
 /// The queue tile mappings go out on, once there is one.
+static SPARSE_QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
+
 pub fn queue() -> Option<ID3D12CommandQueue> {
-    STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
+    SPARSE_QUEUE.lock().unwrap().clone()
 }
 
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
