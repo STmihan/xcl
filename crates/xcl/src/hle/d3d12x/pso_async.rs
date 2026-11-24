@@ -63,6 +63,43 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
 }
 
 /// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
+/// Builds in flight now (`build`), and a number per build, for the memory lines below.
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static BUILD_NUMBER: AtomicUsize = AtomicUsize::new(0);
+
+const MIB: u64 = 1 << 20;
+
+/// A build that has started: its number, when, and the process's commit charge then.
+struct BuildStart {
+    number: usize,
+    at: std::time::Instant,
+    commit: u64,
+}
+
+/// Logs a build's start with the process's commit charge and the builds already in flight, so
+/// the memory a driver compile holds (during it, and whether it gives it back) can be read from
+/// the log: a retail title's world load ran out of commit while XCL's own pools stayed flat.
+fn build_starts(preload: bool) -> BuildStart {
+    let number = BUILD_NUMBER.fetch_add(1, Ordering::Relaxed) + 1;
+    let others = IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+    let commit = crate::hle::kernelx::process_private_bytes();
+    let by = if preload { "preload" } else { "bind" };
+    crate::xlog_info!("D3D12.X: pipeline build #{number} starts ({by}): commit {} MB, {others} other builds in flight", commit / MIB);
+    BuildStart { number, at: std::time::Instant::now(), commit }
+}
+
+fn build_ends(s: BuildStart) {
+    let others = IN_FLIGHT.fetch_sub(1, Ordering::AcqRel) - 1;
+    let commit = crate::hle::kernelx::process_private_bytes();
+    let delta = commit as i64 / MIB as i64 - s.commit as i64 / MIB as i64;
+    crate::xlog_info!(
+        "D3D12.X: pipeline build #{} ends after {} ms: commit {} MB ({delta:+} MB), {others} other builds in flight",
+        s.number,
+        s.at.elapsed().as_millis(),
+        commit / MIB
+    );
+}
+
 fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
@@ -73,7 +110,10 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, job());
+    let started = build_starts(preload);
+    let built = job();
+    build_ends(started);
+    complete(p, built);
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
