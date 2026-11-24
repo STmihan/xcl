@@ -495,7 +495,8 @@ pub struct Options {
     /// every access from the high address bits
     pub mem_windows: u32,
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
-    /// always the guarded block chain)
+    /// always the guarded block chain) and its skip guards do not outweigh the program
+    /// (`GUARDS_OUTWEIGH_THE_CODE`)
     pub structured: bool,
     /// a `// pc: disassembly` line before every instruction's HLSL (true, or `XCL_RECOMP_COMMENTS`):
     /// for reading a dump – a third of the text of a large program, nothing in its DXIL
@@ -553,7 +554,19 @@ struct Ctx<'a> {
     edges: &'a [(u64, u64)],
     /// `structurable_to` results: (lo, hi, exit) → targets leaving the range
     memo: std::cell::RefCell<std::collections::HashMap<MemoKey, Option<BTreeSet<u64>>>>,
+    /// bytes of the `if (!(skip … || skip …)) {` lines `emit_structured` wrote
+    guard_bytes: std::cell::Cell<usize>,
 }
+
+/// A structured program whose skip guards are more than this share of its code (1 / N) is emitted
+/// as the guarded block chain instead. Every item after a forward jump out of its level is under
+/// `if (!(skip_a || skip_b || …))` with one flag per pending target, so a program with thousands
+/// of crossing jumps gets guards quadratic in their number: one compute program of a retail pack
+/// (76 696 instructions, 3 861 flags) was 111 MB of HLSL, 92 % of it guards, against 4.8 MB as
+/// the block chain – and DXC 1.9 went past 32 GB of memory on it within half a minute at -O0 and
+/// at -O1 alike. The next largest share in that pack's 26 698 programs is 5.6 %
+/// (docs/code/recompiler-hlsl-size.md).
+const GUARDS_OUTWEIGH_THE_CODE: usize = 2;
 
 /// How a block ends (from its last instruction).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1005,7 +1018,9 @@ fn emit_structured(
             }
             if !pending.is_empty() {
                 let cond: Vec<String> = pending.iter().map(|&t| skip_flag(t)).collect();
-                body.push_str(&format!("{pad}if (!({})) {{\n", cond.join(" || ")));
+                let opening = format!("{pad}if (!({})) {{\n", cond.join(" || "));
+                c.guard_bytes.set(c.guard_bytes.get() + opening.len());
+                body.push_str(&opening);
                 guard = Some(pending.clone());
             }
         }
@@ -1422,11 +1437,18 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let traced = emit_program(&insts, opt, &starts, &leaders, branches, Predication::Traced);
+    // the form is chosen once, from the first emission: the passes after it keep it
+    let block_chain = Options { structured: false, ..opt.clone() };
+    let (opt, traced) = if traced.guards_outweigh_the_code {
+        (&block_chain, emit_program(&insts, &block_chain, &starts, &leaders, branches, Predication::Traced))
+    } else {
+        (opt, traced)
+    };
     let planned = match traced.em.lane_trace.as_ref().map(|trace| predication::plan(&insts, opt.wave64, trace)) {
         Some(plan) if !plan.is_empty() => emit_program(&insts, opt, &starts, &leaders, branches, Predication::Planned(plan)),
         _ => traced,
     };
-    let Emitted { em, body, blocks } = planned;
+    let Emitted { em, body, blocks, .. } = planned;
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();
     Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
@@ -1441,6 +1463,8 @@ struct Emitted {
     em: emit::Em,
     body: String,
     blocks: usize,
+    /// structured, and more guard than program (`GUARDS_OUTWEIGH_THE_CODE`)
+    guards_outweigh_the_code: bool,
 }
 
 fn drops_unobservable_predication(opt: &Options) -> bool {
@@ -1493,6 +1517,7 @@ fn emit_program(insts: &[Decoded], opt: &Options, starts: &BTreeSet<u64>, leader
     }
     let mut body = String::new();
     let mut blocks = 0usize;
+    let mut guards_outweigh_the_code = false;
     if branches == 0 {
         // straight line: stop at the first s_endpgm (the rest is unreachable)
         em.indent = 1;
@@ -1513,15 +1538,16 @@ fn emit_program(insts: &[Decoded], opt: &Options, starts: &BTreeSet<u64>, leader
         let leaders: Vec<u64> = leaders.iter().copied().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
-        let ctx = Ctx { insts, starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
+        let ctx = Ctx { insts, starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default(), guard_bytes: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
         let nested = nested_loop_ranges(&insts);
-        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, memo: Default::default() };
+        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, memo: Default::default(), guard_bytes: Default::default() };
         if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&sctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
             emit_structured(&sctx, &mut em, &mut code, 0, u64::MAX, None, 0, &Conts::default(), &BTreeSet::new(), 1, &mut blocks, &mut flags);
+            guards_outweigh_the_code = sctx.guard_bytes.get() * GUARDS_OUTWEIGH_THE_CODE > code.len();
         } else {
             if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
                 code.push_str("    uint pc = xcl_entry_pc;\n");
@@ -1535,7 +1561,7 @@ fn emit_program(insts: &[Decoded], opt: &Options, starts: &BTreeSet<u64>, leader
         }
         body.push_str(&code);
     }
-    Emitted { em, body, blocks }
+    Emitted { em, body, blocks, guards_outweigh_the_code }
 }
 
 #[cfg(test)]

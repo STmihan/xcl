@@ -45,6 +45,11 @@ destination:
   register. `s_mov_b64 s[8:9], s[7:8]` keeps its temporaries.
 - A move of a register (or pair) onto itself writes nothing.
 - A destination that is not a register (`Dst::Null`) with no SCC writes nothing.
+- An SCC that nothing reads (`scc_liveness`, kernel / compute / mesh programs) counts as no SCC: it is
+  not written, so its condition cannot keep the temporary alive. `s_add_u32 s0, s0, s1` followed by an
+  instruction that overwrites SCC is `s0 = s0 + s1;`, and an `s_and_b32` into the null register whose
+  SCC is dead leaves no text (`Em::read_scc_write`,
+  `tests::a_dead_scc_write_does_not_keep_a_temporary`).
 
 `s_*_saveexec` / `s_*_wrexec`:
 
@@ -56,6 +61,25 @@ destination:
   fully buffered form.
 
 The check is by identifier (`mentions_identifier`), never by substring: `s1` is not found in `s10`.
+
+## Skip guards that outweigh the program
+
+Structured control flow puts every item after a forward jump out of its level under
+`if (!(skip_a || skip_b || ...))`, one flag per pending target (`emit_structured` in `mod.rs`). With
+thousands of crossing jumps the guards grow with the square of their number. One compute program of a
+retail pack (76 696 instructions, 3 861 skip flags) came to 111 318 363 bytes of HLSL, 92 % of it
+guard lines (152 MB in the form with comments and four-space indentation); as the guarded block chain
+the same program is 4 819 218 bytes. DXC 1.9.2609 does not get through the structured form at any
+level: its memory went past 40 GB within 55 s at `-O1` and past 32 GB within 28 s at `-O0` (both runs
+were ended there).
+
+The block chain has structured stretches of its own (`structured_span`), with the same guards; in
+that pack none of them is large.
+
+`translate` therefore emits a program as the block chain when the guard lines of its structured form
+are more than half of its code (`GUARDS_OUTWEIGH_THE_CODE`). Over the 26 698 programs of that pack the
+largest shares are 92 % (that program) and then 5.6 %; no other program is more than 12 % larger
+structured than as the block chain. Test: `tests::a_program_with_more_guard_than_code_is_emitted_as_the_block_chain`.
 
 ## DXC optimisation level
 

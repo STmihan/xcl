@@ -7952,3 +7952,49 @@ fn gpu_scalar_results_written_in_place_keep_aliased_operands_and_scc() {
     assert_eq!((r.sgpr[32], r.sgpr[33]), (0x0000_FFFF, 0), "s_or_saveexec_b64 saves the narrowed exec");
     assert_eq!((r.sgpr[36], r.sgpr[37]), (0x000F_FFF0, 0), "s_andn1_wrexec_b64 returns the new exec");
 }
+
+/// Crossing forward jumps: each adds a skip flag to the guards of everything up to its target, so
+/// the guards grow with the square of their number. Where they outweigh the program
+/// (`GUARDS_OUTWEIGH_THE_CODE`) it is emitted as the block chain, with the same result.
+#[test]
+fn a_program_with_more_guard_than_code_is_emitted_as_the_block_chain() {
+    const INSTRUCTION_BYTES: usize = 4;
+    const SOURCE_BYTES: usize = 3 * INSTRUCTION_BYTES;
+    const BRANCH_AT: usize = 2 * INSTRUCTION_BYTES;
+    const TAKEN_AT: u32 = 5;
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let step = |k: usize| 1 + (k % 7) as u32;
+    // `jumps` sources (s1 += 1; jump to target k if bit k of s0), then the targets (s2 += step)
+    let crossing = |jumps: usize| {
+        let mut code = Vec::new();
+        for k in 0..jumps {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)]));
+            code.extend(i("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + (k % 32) as u64)]));
+            let (at, target) = (k * SOURCE_BYTES + BRANCH_AT, jumps * SOURCE_BYTES + k * INSTRUCTION_BYTES);
+            let words = (target - at) / INSTRUCTION_BYTES - 1;
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", words as u64)]));
+        }
+        for k in 0..jumps {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 128 + step(k) as u64)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        code
+    };
+    let is_block_chain = |hlsl: &str| hlsl.contains("if (pc ==");
+    let block_chain = |code: &[u8]| translate(code, &Options { structured: false, ..Options::default() }).unwrap().hlsl;
+    let few = translate(&crossing(3), &Options::default()).unwrap();
+    assert!(few.complete() && !is_block_chain(&few.hlsl), "{}", few.hlsl);
+    let jumps = 40;
+    let code = crossing(jumps);
+    let many = translate(&code, &Options::default()).unwrap();
+    assert!(many.complete() && is_block_chain(&many.hlsl), "{}", many.hlsl);
+    assert!(many.hlsl == block_chain(&code), "{}", many.hlsl);
+    if !gpu_ready() {
+        return;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[0] = 1 << TAKEN_AT;
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let targets_run: u32 = (TAKEN_AT as usize..jumps).map(step).sum();
+    assert_eq!((r.sgpr[1], r.sgpr[2]), (TAKEN_AT + 1, targets_run));
+}
