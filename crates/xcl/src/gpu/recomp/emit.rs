@@ -76,6 +76,45 @@ const NOOPS: &[&str] = &[
     "s_set_gpr_idx_off", "s_version", "buffer_gl0_inv", "buffer_gl1_inv", "ds_nop",
 ];
 
+fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn mentions_identifier(expression: &str, identifier: &str) -> bool {
+    expression.split(|c| !is_identifier_char(c)).any(|token| token == identifier)
+}
+
+fn replace_identifier(expression: &str, from: &str, to: &str) -> String {
+    let mut replaced = String::with_capacity(expression.len());
+    let mut rest = expression;
+    while !rest.is_empty() {
+        let in_token = rest.starts_with(is_identifier_char);
+        let end = rest.find(|c| is_identifier_char(c) != in_token).unwrap_or(rest.len());
+        let (run, tail) = rest.split_at(end);
+        replaced.push_str(if in_token && run == from { to } else { run });
+        rest = tail;
+    }
+    replaced
+}
+
+fn scalar_register_name(dst: &Dst) -> Option<String> {
+    match dst {
+        Dst::S(n) => sname(*n),
+        _ => None,
+    }
+}
+
+fn scalar_register_pair_names(dst: &Dst) -> Option<(String, String)> {
+    match dst {
+        Dst::S(n) => Some((sname(*n)?, sname(*n + 1)?)),
+        _ => None,
+    }
+}
+
+fn is_register_named(dst: &Dst, name: &str) -> bool {
+    scalar_register_name(dst).is_some_and(|register| register == name)
+}
+
 fn sname(code: u64) -> Option<String> {
     Some(match code {
         0..=105 => format!("s{code}"),
@@ -1148,24 +1187,12 @@ impl Em {
                 let s0 = self.read(d, ins[0], false).ok_or("op")?;
                 let el = self.sreg(126);
                 let nl = op(&s0, &el).ok_or("saveexec")?;
-                let (t0, o0) = (self.t(), self.t());
-                self.line(&format!("uint {o0} = {el};"));
-                self.line(&format!("uint {t0} = {nl};"));
-                self.line(&format!("{el} = {t0};"));
-                self.line(&format!("scc = (uint)({t0} != 0u);"));
-                let v = if name.contains("wrexec") { t0 } else { o0 };
-                self.write32(&dst, &v);
+                self.write_saveexec(&dst, name.contains("wrexec"), &[el], &[nl]);
             } else {
                 let s0 = self.read64(d, ins[0], false).ok_or("op")?;
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let (nl, nh) = (op(&s0.0, &el).ok_or("saveexec")?, op(&s0.1, &eh).ok_or("saveexec")?);
-                let (t0, t1, o0, o1) = (self.t(), self.t(), self.t(), self.t());
-                self.line(&format!("uint {o0} = {el}; uint {o1} = {eh};"));
-                self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
-                self.line(&format!("{el} = {t0}; {eh} = {t1};"));
-                self.line(&format!("scc = (uint)(({t0} | {t1}) != 0u);"));
-                let (a, b) = if name.contains("wrexec") { (t0, t1) } else { (o0, o1) };
-                self.write64(&dst, &a, &b);
+                self.write_saveexec(&dst, name.contains("wrexec"), &[el, eh], &[nl, nh]);
             }
             return Ok(());
         }
@@ -1285,12 +1312,106 @@ impl Em {
             "s_pack_hh_b32_b16" => (format!("({a} >> 16) | ({b} & 0xFFFF0000u)"), None),
             _ => return Err("SALU"),
         };
-        self.line(&format!("uint {t} = {res};"));
-        if let Some(c) = scc {
-            self.line(&format!("scc = (uint)({c});"));
+        if name == "s_mov_b32" && is_register_named(&dst, &a) {
+            return Ok(());
         }
-        self.write32(&dst, &t);
+        self.write_scalar_result(&dst, &t, &res, scc.as_deref());
         Ok(())
+    }
+
+    fn write_halves(&mut self, dst: &Dst, values: &[String]) {
+        match values {
+            [lo, hi] => self.write64(dst, lo, hi),
+            [lo] => self.write32(dst, lo),
+            _ => {}
+        }
+    }
+
+    fn declare_halves(&mut self, values: &[String]) -> Vec<String> {
+        let temps: Vec<String> = values.iter().map(|_| self.t()).collect();
+        let declarations: Vec<String> = temps.iter().zip(values).map(|(t, v)| format!("uint {t} = {v};")).collect();
+        self.line(&declarations.join(" "));
+        temps
+    }
+
+    fn write_saveexec(&mut self, dst: &Dst, dst_gets_new_exec: bool, exec: &[String], new_exec: &[String]) {
+        let exec_dst = Dst::S(126);
+        let nonzero = format!("scc = (uint)(({}) != 0u);", exec.join(" | "));
+        let dst_halves: Vec<String> = match dst {
+            Dst::S(n) => (0..exec.len() as u64).filter_map(|half| sname(n + half)).collect(),
+            _ => Vec::new(),
+        };
+        let reads_any = |expressions: &[String], names: &[String]| names.iter().any(|n| expressions.iter().any(|e| mentions_identifier(e, n)));
+        let dst_overlaps_exec = dst_halves.iter().any(|d| exec.contains(d));
+        let high_half_reads_low_exec = new_exec.len() == 2 && mentions_identifier(&new_exec[1], &exec[0]);
+        if dst_overlaps_exec || high_half_reads_low_exec {
+            let old = self.declare_halves(exec);
+            let new = self.declare_halves(new_exec);
+            self.write_halves(&exec_dst, &new);
+            self.line(&nonzero);
+            self.write_halves(dst, if dst_gets_new_exec { &new } else { &old });
+        } else if dst_gets_new_exec || dst_halves.is_empty() {
+            self.write_halves(&exec_dst, new_exec);
+            self.line(&nonzero);
+            if dst_gets_new_exec {
+                self.write_halves(dst, exec);
+            }
+        } else if reads_any(new_exec, &dst_halves) {
+            let old = self.declare_halves(exec);
+            self.write_halves(&exec_dst, new_exec);
+            self.line(&nonzero);
+            self.write_halves(dst, &old);
+        } else {
+            self.write_halves(dst, exec);
+            self.write_halves(&exec_dst, new_exec);
+            self.line(&nonzero);
+        }
+    }
+
+    fn write_scalar_result(&mut self, dst: &Dst, temp: &str, value: &str, scc: Option<&str>) {
+        let register = scalar_register_name(dst);
+        let scc_reads_register = register.as_ref().is_some_and(|r| scc.is_some_and(|c| mentions_identifier(c, r)));
+        match register {
+            None if scc.is_none() => {}
+            Some(register) if !scc_reads_register => {
+                self.write32(dst, value);
+                if let Some(c) = scc {
+                    self.line(&format!("scc = (uint)({});", replace_identifier(c, temp, &register)));
+                }
+            }
+            _ => {
+                self.line(&format!("uint {temp} = {value};"));
+                if let Some(c) = scc {
+                    self.line(&format!("scc = (uint)({c});"));
+                }
+                self.write32(dst, temp);
+            }
+        }
+    }
+
+    fn write_scalar_pair_result(&mut self, dst: &Dst, temps: (&str, &str), values: (&str, &str), scc: Option<&str>) {
+        let registers = scalar_register_pair_names(dst);
+        let overlaps = registers.as_ref().is_some_and(|(lo, hi)| {
+            mentions_identifier(values.1, lo) || scc.is_some_and(|c| mentions_identifier(c, lo) || mentions_identifier(c, hi))
+        });
+        match registers {
+            None if scc.is_none() => {}
+            Some((lo, hi)) if !overlaps => {
+                if (values.0, values.1) != (lo.as_str(), hi.as_str()) {
+                    self.write64(dst, values.0, values.1);
+                }
+                if let Some(c) = scc {
+                    self.line(&format!("scc = (uint)({});", replace_identifier(&replace_identifier(c, temps.0, &lo), temps.1, &hi)));
+                }
+            }
+            _ => {
+                self.line(&format!("uint {} = {}; uint {} = {};", temps.0, values.0, temps.1, values.1));
+                if let Some(c) = scc {
+                    self.line(&format!("scc = (uint)({c});"));
+                }
+                self.write64(dst, temps.0, temps.1);
+            }
+        }
     }
 
     /// Scalar relative moves: uniform M0 selects an SGPR from the encoded base. HLSL has
@@ -1458,14 +1579,10 @@ impl Em {
                 }
             }
         };
-        self.line(&format!("uint {t0} = {lo}; uint {t1} = {hi};"));
-        if let Some(c) = scc {
-            self.line(&format!("scc = (uint)({c});"));
-        }
         if matches!(name, "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" | "s_ff0_i32_b64" | "s_ff1_i32_b64" | "s_flbit_i32_b64" | "s_flbit_i32_i64") {
-            self.write32(dst, &t0);
+            self.write_scalar_result(dst, &t0, &lo, scc.as_deref());
         } else {
-            self.write64(dst, &t0, &t1);
+            self.write_scalar_pair_result(dst, (&t0, &t1), (&lo, &hi), scc.as_deref());
         }
         Ok(())
     }
