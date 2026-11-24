@@ -43,6 +43,8 @@ pub(super) struct Em {
     /// split wave64: pc → SGPRs whose whole value may be read after that instruction
     /// (`x64_masks`); a mask written to none of them stays in its half (no exchange)
     pub x64_whole_live: BTreeMap<u64, u128>,
+    /// pcs of the instructions whose SCC write nothing reads (`scc_liveness`): not emitted
+    pub dead_scc_writes: BTreeSet<u64>,
     /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
     /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
     pub upper: Option<super::upper_lanes::UpperLanes>,
@@ -481,6 +483,7 @@ impl Em {
             uses_scratch: false,
             x64_words: 1,
             x64_whole_live: BTreeMap::new(),
+            dead_scc_writes: BTreeSet::new(),
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
@@ -563,6 +566,13 @@ impl Em {
         }
         self.out.push_str(s);
         self.out.push('\n');
+    }
+
+    /// `scc = value;` unless no path reads what the current instruction writes to SCC.
+    fn set_scc(&mut self, value: &str) {
+        if !self.dead_scc_writes.contains(&self.cur_pc) {
+            self.line(&format!("scc = {value};"));
+        }
     }
 
     fn t(&mut self) -> String {
@@ -1072,14 +1082,14 @@ impl Em {
                 "s_addk_i32" => {
                     let t = self.t();
                     self.line(&format!("uint {t} = {cur} + {};", hex(k_s)));
-                    self.line(&format!("scc = ((({cur} ^ {t}) & ({} ^ {t})) >> 31);", hex(k_s)));
+                    self.set_scc(&format!("((({cur} ^ {t}) & ({} ^ {t})) >> 31)", hex(k_s)));
                     self.write32(&dst, &t);
                 }
                 "s_mulk_i32" => self.write32(&dst, &format!("(uint)((int){cur} * {})", k_s as i32)),
                 _ if name.starts_with("s_cmpk_") => {
                     let (op, signed) = cmp_op(&name[7..]).ok_or("comparison")?;
                     let (a, b) = if signed { (format!("(int){cur}"), format!("{}", k_s as i32)) } else { (cur.clone(), format!("{k_u}u")) };
-                    self.line(&format!("scc = (uint)({a} {op} {b});"));
+                    self.set_scc(&format!("(uint)({a} {op} {b})"));
                 }
                 _ => return Err("SOPK"),
             }
@@ -1091,9 +1101,9 @@ impl Em {
                 let b = self.read(d, ins[1], false).ok_or("op")?;
                 let bit = format!("((select(({b} & 32u) == 0u, {a0}, {a1}) >> ({b} & 31u)) & 1u)");
                 if name == "s_bitcmp0_b64" {
-                    self.line(&format!("scc = (uint)({bit} == 0u);"));
+                    self.set_scc(&format!("(uint)({bit} == 0u)"));
                 } else {
-                    self.line(&format!("scc = {bit};"));
+                    self.set_scc(&bit);
                 }
                 return Ok(());
             }
@@ -1106,19 +1116,19 @@ impl Em {
                     _ => return Err("SOPC"),
                 };
                 let j = if op == "==" { "&&" } else { "||" };
-                self.line(&format!("scc = (uint)({} {op} {} {j} {} {op} {});", a.0, b.0, a.1, b.1));
+                self.set_scc(&format!("(uint)({} {op} {} {j} {} {op} {})", a.0, b.0, a.1, b.1));
                 return Ok(());
             }
             let (a, b) = (self.read(d, ins[0], false).ok_or("op")?, self.read(d, ins[1], false).ok_or("op")?);
             if let Some(rest) = name.strip_prefix("s_cmp_") {
                 let (op, signed) = cmp_op(rest).ok_or("comparison")?;
                 let (a, b) = if signed { (format!("(int){a}"), format!("(int){b}")) } else { (a, b) };
-                self.line(&format!("scc = (uint)({a} {op} {b});"));
+                self.set_scc(&format!("(uint)({a} {op} {b})"));
                 return Ok(());
             }
             match name {
-                "s_bitcmp0_b32" => self.line(&format!("scc = (uint)((({a} >> ({b} & 31u)) & 1u) == 0u);")),
-                "s_bitcmp1_b32" => self.line(&format!("scc = (({a} >> ({b} & 31u)) & 1u);")),
+                "s_bitcmp0_b32" => self.set_scc(&format!("(uint)((({a} >> ({b} & 31u)) & 1u) == 0u)")),
+                "s_bitcmp1_b32" => self.set_scc(&format!("(({a} >> ({b} & 31u)) & 1u)")),
                 _ => return Err("SOPC"),
             }
             return Ok(());
@@ -1149,7 +1159,7 @@ impl Em {
                 self.line(&format!("uint {o0} = {el};"));
                 self.line(&format!("uint {t0} = {nl};"));
                 self.line(&format!("{el} = {t0};"));
-                self.line(&format!("scc = (uint)({t0} != 0u);"));
+                self.set_scc(&format!("(uint)({t0} != 0u)"));
                 let v = if name.contains("wrexec") { t0 } else { o0 };
                 self.write32(&dst, &v);
             } else {
@@ -1160,7 +1170,7 @@ impl Em {
                 self.line(&format!("uint {o0} = {el}; uint {o1} = {eh};"));
                 self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
                 self.line(&format!("{el} = {t0}; {eh} = {t1};"));
-                self.line(&format!("scc = (uint)(({t0} | {t1}) != 0u);"));
+                self.set_scc(&format!("(uint)(({t0} | {t1}) != 0u)"));
                 let (a, b) = if name.contains("wrexec") { (t0, t1) } else { (o0, o1) };
                 self.write64(&dst, &a, &b);
             }
@@ -1284,7 +1294,7 @@ impl Em {
         };
         self.line(&format!("uint {t} = {res};"));
         if let Some(c) = scc {
-            self.line(&format!("scc = (uint)({c});"));
+            self.set_scc(&format!("(uint)({c})"));
         }
         self.write32(&dst, &t);
         Ok(())
@@ -1457,7 +1467,7 @@ impl Em {
         };
         self.line(&format!("uint {t0} = {lo}; uint {t1} = {hi};"));
         if let Some(c) = scc {
-            self.line(&format!("scc = (uint)({c});"));
+            self.set_scc(&format!("(uint)({c})"));
         }
         if matches!(name, "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" | "s_ff0_i32_b64" | "s_ff1_i32_b64" | "s_flbit_i32_b64" | "s_flbit_i32_i64") {
             self.write32(dst, &t0);

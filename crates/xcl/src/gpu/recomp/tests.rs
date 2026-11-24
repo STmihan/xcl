@@ -203,6 +203,7 @@ fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
 fn scalar_bitcmp_64_selects_the_indexed_half() {
     let code = prog(&[
         ("S_BITCMP1_B64", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 8)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 135), ("SSRC1", 136)], None),
         ("S_BITCMP0_B64", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 9)], None),
     ]);
     let t = translate(&code, &Options::default()).unwrap();
@@ -7451,4 +7452,166 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+// ---- dead SCC writes (`scc_liveness`)
+
+fn compute_mode() -> Options {
+    Options { mode: Mode::Compute(super::CsInterface { threads: [64, 1, 1], ..Default::default() }), ..Default::default() }
+}
+
+/// Number of `scc = …` statements in the translation.
+fn emitted_scc_writes(code: &[u8], opt: &Options) -> usize {
+    let t = translate(code, opt).unwrap();
+    t.hlsl.lines().filter(|l| l.trim_start().starts_with("scc = ")).count()
+}
+
+type Asm = (&'static str, &'static str, &'static [(&'static str, u64)], Option<u32>);
+const SCC_SOURCE: u64 = 253;
+const CMP_S0_S1: Asm = ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 1)], None);
+const CMP_S2_ZERO: Asm = ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 128)], None);
+const AND_S2: Asm = ("S_AND_B32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 0), ("SSRC1", 1)], None);
+const SUB_S1_ONE: Asm = ("S_SUB_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None);
+const MOV_S9_S8: Asm = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 8)], None);
+const CSELECT_S3: Asm = ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 135), ("SSRC1", 136)], None);
+const BRANCH_TO_NEXT: Asm = ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0)], None);
+
+#[test]
+fn scc_writes_overwritten_before_any_read_are_not_emitted() {
+    let code = prog(&[CMP_S0_S1, AND_S2, CMP_S2_ZERO, CSELECT_S3]);
+    let t = translate(&code, &compute_mode()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(emitted_scc_writes(&code, &compute_mode()), 1, "{}", t.hlsl);
+    assert!(t.hlsl.contains("scc = (uint)(s2 != 0u);") && t.hlsl.contains(" = s0 & s1;") && t.hlsl.contains("select(scc != 0u, 7u, 8u)"), "{}", t.hlsl);
+}
+
+#[test]
+fn the_last_scc_write_is_kept_only_where_the_program_end_reads_it() {
+    let code = prog(&[CMP_S0_S1, AND_S2]);
+    assert_eq!(emitted_scc_writes(&code, &Options::default()), 1);
+    assert_eq!(emitted_scc_writes(&code, &compute_mode()), 0);
+}
+
+#[test]
+fn an_scc_write_reaches_every_kind_of_reader() {
+    let readers: &[Asm] = &[
+        CSELECT_S3,
+        ("S_CSELECT_B64", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 6), ("SSRC1", 10)], None),
+        ("S_CMOV_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 8)], None),
+        ("S_CMOV_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 6)], None),
+        ("S_CMOVK_I32", "ENC_SOPK", &[("SDST", 3), ("SIMM16", 5)], None),
+        ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 8), ("SSRC1", 128)], None),
+        ("S_SUBB_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 8), ("SSRC1", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", SCC_SOURCE)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 8), ("SSRC1", SCC_SOURCE)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", SCC_SOURCE)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", SCC_SOURCE), ("VSRC1", 2)], None),
+        ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
+    ];
+    for reader in readers {
+        let code = prog(&[CMP_S0_S1, MOV_S9_S8, BRANCH_TO_NEXT, *reader]);
+        for structured in [true, false] {
+            assert_eq!(emitted_scc_writes(&code, &Options { structured, ..compute_mode() }), 1, "{}", reader.0);
+        }
+    }
+    let unread = prog(&[CMP_S0_S1, MOV_S9_S8, BRANCH_TO_NEXT, MOV_S9_S8]);
+    assert_eq!(emitted_scc_writes(&unread, &compute_mode()), 0);
+}
+
+#[test]
+fn an_scc_write_is_kept_when_only_one_path_overwrites_it() {
+    let code = prog(&[CMP_S0_S1, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)], None), CMP_S2_ZERO, CSELECT_S3]);
+    for structured in [true, false] {
+        assert_eq!(emitted_scc_writes(&code, &Options { structured, ..compute_mode() }), 2);
+    }
+}
+
+/// s_cselect (head); s_and; s_sub; s_cbranch_vccz head: the s_sub's SCC is read by the next
+/// iteration's s_cselect only, the s_and's by nothing.
+#[test]
+fn an_scc_write_in_a_loop_reaches_the_next_iteration() {
+    const BACK_TO_START: u64 = 0xFFFC;
+    let code = prog(&[CSELECT_S3, AND_S2, SUB_S1_ONE, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", BACK_TO_START)], None)]);
+    for structured in [true, false] {
+        let opt = Options { structured, ..compute_mode() };
+        let t = translate(&code, &opt).unwrap();
+        assert_eq!(emitted_scc_writes(&code, &opt), 1, "{}", t.hlsl);
+        assert!(t.hlsl.contains("scc = (uint)(1u > s1);"), "{}", t.hlsl);
+    }
+}
+
+/// The loop may be left at its `LOOP_GUARD` before its compare runs: in kernel mode the end
+/// then reads the SCC written before the loop.
+#[test]
+fn an_scc_write_before_a_loop_survives_the_loop_guard_exit() {
+    const BACK_TO_LOOP_HEAD: u64 = 0xFFFE;
+    let code = prog(&[CMP_S0_S1, CMP_S2_ZERO, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", BACK_TO_LOOP_HEAD)], None)]);
+    for structured in [true, false] {
+        assert_eq!(emitted_scc_writes(&code, &Options { structured, ..Options::default() }), 2);
+        assert_eq!(emitted_scc_writes(&code, &Options { structured, ..compute_mode() }), 0);
+    }
+}
+
+#[test]
+fn graphics_and_geometry_programs_keep_every_scc_write() {
+    let code = prog(&[CMP_S0_S1, AND_S2]);
+    for mode in [Mode::Geometry(super::GsInterface::default()), Mode::Vertex(Default::default()), Mode::Pixel(Default::default())] {
+        assert_eq!(emitted_scc_writes(&code, &Options { mode, ..Default::default() }), 2);
+    }
+}
+
+/// Every scalar instruction alone in a kernel (whose end reads SCC): the analysis says
+/// "overwrites" / "reads" exactly where the emitted statements assign / mention `scc`.
+#[test]
+fn scc_liveness_rules_match_what_the_emitter_reads_and_writes() {
+    use super::scc_liveness::{overwrites_scc, reads_scc};
+    let mut checked = 0;
+    for inst in crate::gpu::rdna2::all_instructions() {
+        let Some(bytes) = ["ENC_SOP1", "ENC_SOP2", "ENC_SOPK", "ENC_SOPC"].iter().find_map(|e| encode(inst.name, e, &[], inst.always_literal.then_some(0)).ok()) else { continue };
+        let d = crate::gpu::rdna2::decode(&bytes, 0).unwrap();
+        let mut code = bytes.clone();
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let t = translate(&code, &Options::default()).unwrap();
+        let statements: Vec<&str> = t
+            .hlsl
+            .lines()
+            .map(str::trim_start)
+            .skip_while(|l| !l.starts_with("// 0000:"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("// 00"))
+            .collect();
+        let writes = statements.iter().any(|l| l.starts_with("scc = "));
+        let reads = statements.iter().any(|l| l.strip_prefix("scc = ").unwrap_or(l).contains("scc"));
+        assert_eq!(writes, overwrites_scc(&d), "{} writes SCC\n{statements:?}", inst.name);
+        assert_eq!(reads, reads_scc(&d), "{} reads SCC\n{statements:?}", inst.name);
+        checked += 1;
+    }
+    assert!(checked > 150, "{checked}");
+}
+
+#[test]
+fn gpu_dropped_scc_writes_leave_the_results_unchanged() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 1)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 255), ("SSRC1", 130)], Some(0xFFFF_FFFF)),
+        ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 128), ("SSRC1", 128)], None),
+        CMP_S0_S1,
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", SCC_SOURCE)], None),
+        ("S_AND_B32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 135), ("SSRC1", 136)], None),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 7), ("SSRC0", 128), ("SSRC1", 128)], None),
+    ]);
+    assert_eq!(emitted_scc_writes(&code, &Options::default()), 4);
+    let mut st = KernelState::default();
+    st.sgpr[0] = 5;
+    st.sgpr[1] = 5;
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!((r.sgpr[2], r.sgpr[3], r.sgpr[4], r.sgpr[5], r.sgpr[6], r.sgpr[7]), (1, 1, 1, 0, 7, 0));
+    assert_eq!(r.scc, 0);
 }
