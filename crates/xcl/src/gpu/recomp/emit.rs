@@ -64,7 +64,12 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    pub predication: super::predication::Plan,
+    pub lane_trace: Option<super::predication::Trace>,
 }
+
+/// Compute programs: the lane's bit of EXEC (`Em::keeps_lane_test`).
+const LANE_ACTIVE: &str = "xcl_active";
 
 /// Instructions without an effect in this execution model.
 const NOOPS: &[&str] = &[
@@ -490,6 +495,8 @@ impl Em {
             has_f64_round_op: false,
             dynamic_f16_rm: false,
             safe_barrier: false,
+            predication: Default::default(),
+            lane_trace: None,
         }
     }
 
@@ -558,11 +565,30 @@ impl Em {
     }
 
     fn line(&mut self, s: &str) {
+        let (pc, lane_test) = (self.cur_pc, self.lane_test());
+        if let Some(trace) = &mut self.lane_trace {
+            trace.statement(pc, s, lane_test);
+        }
+        self.push_line(s);
+    }
+
+    fn push_line(&mut self, s: &str) {
         for _ in 0..self.indent {
             self.out.push_str("    ");
         }
         self.out.push_str(s);
         self.out.push('\n');
+        if self.keeps_lane_test() && super::predication::assigns_exec(s) {
+            let refresh = format!("{LANE_ACTIVE} = {};", self.exec_lane_test());
+            self.push_line(&refresh);
+        }
+    }
+
+    /// Compute programs keep the lane's EXEC bit in `xcl_active`, refreshed after every
+    /// statement that assigns EXEC: the big ones are compiled at -O0, where each
+    /// `lanebit(exec_lo, exec_hi)` of a predicated write is its own shift, mask and compare.
+    fn keeps_lane_test(&self) -> bool {
+        matches!(self.opt.mode, Mode::Compute(_))
     }
 
     fn t(&mut self) -> String {
@@ -606,6 +632,35 @@ impl Em {
     }
 
     fn act(&self) -> &'static str {
+        if self.predication.exec_covers_every_lane(self.cur_pc) {
+            "true"
+        } else {
+            self.lane_test()
+        }
+    }
+
+    fn lane_write(&mut self, n: u64, val: &str) -> String {
+        let v = self.vreg(n);
+        let (pc, lane_test) = (self.cur_pc, self.lane_test());
+        if let Some(trace) = &mut self.lane_trace {
+            trace.lane_write(pc, n, val, lane_test);
+        }
+        if self.predication.writes_every_lane(pc, n) {
+            format!("{v} = {val};")
+        } else {
+            format!("{v} = select({lane_test}, {val}, {v});")
+        }
+    }
+
+    fn lane_test(&self) -> &'static str {
+        if self.keeps_lane_test() {
+            LANE_ACTIVE
+        } else {
+            self.exec_lane_test()
+        }
+    }
+
+    fn exec_lane_test(&self) -> &'static str {
         // no short-circuit `?:` (HLSL 2021 makes it a branch – one per instruction at -O0)
         if self.opt.wave64 {
             "lanebit(exec_lo, exec_hi)"
@@ -791,9 +846,8 @@ impl Em {
             // select, not `if`: straight-line code (a branch per VALU write was more than the
             // driver's compiler could take on a 15 000-instruction console shader)
             Dst::V(n) => {
-                let v = self.vreg(*n);
-                let a = self.act();
-                self.line(&format!("{v} = select({a}, {val}, {v});"));
+                let write = self.lane_write(*n, val);
+                self.push_line(&write);
             }
             Dst::S(n) => {
                 let s = self.sreg(*n);
@@ -806,9 +860,8 @@ impl Em {
     fn write64(&mut self, dst: &Dst, lo: &str, hi: &str) {
         match dst {
             Dst::V(n) => {
-                let (a, b) = (self.vreg(*n), self.vreg(*n + 1));
-                let act = self.act();
-                self.line(&format!("{a} = select({act}, {lo}, {a}); {b} = select({act}, {hi}, {b});"));
+                let (low, high) = (self.lane_write(*n, lo), self.lane_write(*n + 1, hi));
+                self.push_line(&format!("{low} {high}"));
             }
             Dst::S(n) => {
                 let (a, b) = (self.sreg(*n), self.sreg(*n + 1));
@@ -834,10 +887,20 @@ impl Em {
             ballot = "xcl_x_ballot_local";
         }
         self.line(&format!("uint2 {m} = {ballot}(and({a}, ({cond})));"));
+        self.trace_exec_bounded_mask(dst);
         if self.opt.wave64 {
             self.write64(dst, &format!("{m}.x"), &format!("{m}.y"));
         } else {
             self.write32(dst, &format!("{m}.x"));
+        }
+    }
+
+    fn trace_exec_bounded_mask(&mut self, dst: &Dst) {
+        let (pc, words) = (self.cur_pc, if self.opt.wave64 { 2 } else { 1 });
+        if let (Some(trace), Dst::S(n)) = (&mut self.lane_trace, dst) {
+            for word in 0..words {
+                trace.exec_bounded_mask(pc, *n + word as u64, word);
+            }
         }
     }
 
@@ -856,6 +919,9 @@ impl Em {
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));
         self.cur_pc = d.pc;
+        if let Some(trace) = &mut self.lane_trace {
+            trace.begin_instruction();
+        }
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {
             return Flow::Jump(t);
@@ -4435,6 +4501,7 @@ impl Em {
                     let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                let _ = writeln!(h, "    bool {LANE_ACTIVE} = {};", self.exec_lane_test());
                 for &v in &self.vgprs {
                     let init = match v {
                         0 => "gtid.x",
