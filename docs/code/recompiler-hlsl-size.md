@@ -71,7 +71,7 @@ retail pack (76 696 instructions, 3 861 skip flags) came to 111 318 363 bytes of
 guard lines (152 MB in the form with comments and four-space indentation); as the guarded block chain
 the same program is 4 819 218 bytes. DXC 1.9.2609 does not get through the structured form at any
 level: its memory went past 40 GB within 55 s at `-O1` and past 32 GB within 28 s at `-O0` (both runs
-were ended there).
+were ended there; the 152 MB form went past 12 GB within 21 s at `-O0`).
 
 The block chain has structured stretches of its own (`structured_span`), with the same guards; in
 that pack none of them is large.
@@ -88,26 +88,64 @@ level is chosen at all: the comment in `dxc::compile_here`):
 
 | HLSL bytes | level |
 | --- | --- |
-| above `UNOPTIMISED_ABOVE_HLSL_BYTES` (3 940 000) | `-O0` |
-| above `LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES` (520 000) | `-O1` |
+| above `UNOPTIMISED_ABOVE_HLSL_BYTES` (64 MiB) | `-O0` |
+| above `LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES` (360 000) | `-O1` |
 | otherwise | DXC default (`-O3`) |
 
-The limits were 8 MiB and 1 MiB while the HLSL carried comments and four-space indentation. They were
-rescaled when those went away so that no program gets a *higher* level than before and none that had
-`-O1` drops to `-O0`. Calibration over all 26 698 programs of one retail shader pack, old size against
-new size of the same program, in the native form (wave64 not split):
+### The `-O0` limit is not rescaled
+
+The limit was 8 MiB at first. The six largest compute programs of one retail pack were above it, and
+their `-O0` DXIL was more than NVIDIA's driver compiler could take: for a 29.6 MB source 21.3 MB of
+DXIL at `-O0` against 9.2 MB at `-O1`, and the driver went past 50 GB of commit on the `-O0` DXIL
+without finishing. The owner's decision since: these programs compile at `-O1`, and the limit became
+64 MiB.
+
+When the HLSL lost its comments, indentation, temporaries, dead SCC writes and unobservable selects,
+the limit could have been rescaled with the text (3 940 000 bytes would have kept "the same programs
+at `-O0`"). It deliberately was not: that would have put exactly those six programs back at `-O0`.
+`-O0` is a safety net for sources far beyond anything measured, so a change that makes the text
+smaller must leave it alone – every program only moves further below it, in every form (split wave64,
+four memory windows, `XCL_RECOMP_COMMENTS`). In the pack the largest HLSL is now 9 302 789 bytes
+with one memory window and 10 330 079 with four: nothing is compiled at `-O0`.
+
+Measured with DXC 1.9.2609 (`dxc.exe -E main -T cs_6_6 -HV 2021 -O1`, one at a time), the HLSL of
+`xcl shaders --recomp` (one memory window, wave64 not split), before = the form with comments,
+four-space indentation, every SCC write and every select:
+
+| program (name hash) | HLSL before | HLSL now | DXIL before | DXIL now | DXC time before | now | peak memory now |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `3a47dae75a517a13` | 29 598 855 | 9 302 789 | 9 236 536 | 8 994 604 | 232 s | 193 s | 2.8 GB |
+| `a983c0d77d33ea04` | 29 524 131 | 9 267 775 | 9 195 688 | 8 958 352 | 166 s | 155 s | 2.8 GB |
+| `a3b015f9c6a34f41` | 12 473 761 | 3 992 519 | 1 975 824 | 1 965 296 | 824 s | 677 s | 0.9 GB |
+| `cb694c31e0525691` | 152 022 357 | 4 819 218 (block chain) | none (see above) | none after 60 min | – | > 3 600 s | 2.6 GB |
+
+The runs were not alone on the machine (a second DXC process beside most of them): differences in
+time of a fifth say nothing. The last program is the one of "Skip guards that outweigh the program":
+as the block chain DXC gets through it at `-O0` (48.7 s, 1.6 GB, 11 356 484 bytes of DXIL) and had
+not finished at `-O1` after an hour. It is the one program of the pack for which the `-O1` rule is
+not yet shown to work.
+
+The text is a third of what it was; the DXIL, which is what the driver compiles, is 2.6 % smaller for the two largest and 0.5 % for the third.
+
+### The `-O1` limit is recalibrated
+
+`-O1` instead of `-O3` costs nothing in DXIL size on large programs and saves DXC time, so here the
+limit follows the text: every program that had `-O1` keeps it. Calibration over all 26 698 programs
+of the pack, size before (limit 1 MiB) against size now of the same program:
 
 | | one memory window | four windows (`XCL_RECOMP_WINDOWS=4`) |
 | --- | --- | --- |
-| programs above 8 MiB before | 6, now 4 029 730 bytes and more | 6, now 4 582 613 and more |
-| programs between 1 and 8 MiB before | 2 143, now 528 261 to 3 450 296 | 2 660, now 583 933 to 3 849 100 |
-| programs below 1 MiB before, now `-O1` | 954 | 1 035 |
+| programs between 1 MiB and 64 MiB before | 2 199, now 386 513 to 9 302 789 bytes | 2 727, now 435 616 to 10 330 079 |
+| programs below 1 MiB before, now `-O1` | 2 006 | 2 039 |
 
-3 940 000 lies between 3 849 100 and 4 029 730, a margin of about 90 KB on either side. The split
-wave64 form NVIDIA GPUs get (`Options::split_wave64`) was not calibrated: `xcl shaders --recomp` does
-not produce it.
+360 000 is 7 % below the smallest program that had `-O1`. The price of keeping all of them is that
+the number of programs at `-O1` about doubles: the two smallest shrank to 37 % of their size where
+most shrank to 45 – 60 %. With the limit at 450 000 those two would go to `-O3` and 1 434 programs
+(one window) would be new at `-O1`.
 
-Any change that makes the HLSL of every program smaller or larger moves programs across these limits
-(the smallest program that must stay at `-O0` is only 2 % above the limit). Repeat the comparison:
-dump every program before and after with `XCL_DUMP_HLSL` and `XCL_DUMP_EVERY=1`, join the sizes by
-file name, and move the limits with it.
+The split wave64 form NVIDIA GPUs get (`Options::split_wave64`) was not calibrated:
+`xcl shaders --recomp` does not produce it.
+
+Any change that makes the HLSL of every program smaller or larger moves programs across this limit.
+Repeat the comparison: dump every program before and after with `XCL_DUMP_HLSL` and
+`XCL_DUMP_EVERY=1`, join the sizes by file name, and move the limit with it. The `-O0` limit stays.

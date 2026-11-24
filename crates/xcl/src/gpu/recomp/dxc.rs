@@ -485,11 +485,16 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 /// therefore deliberately *not* rescaled when the emitter makes the text smaller (comments,
 /// indentation, temporaries, SCC writes and selects have gone since: every program only moved
 /// further below it) – in every form (split wave64, four memory windows, `XCL_RECOMP_COMMENTS`)
-/// the giants stay at -O1. docs/code/recompiler-hlsl-size.md.
+/// the giants stay at -O1. Nothing in that pack is above the limit now (its one 111 MB program,
+/// nine tenths of it skip guards, was beyond DXC at -O0 and -O1 alike and is emitted as the block
+/// chain instead: `GUARDS_OUTWEIGH_THE_CODE`). docs/code/recompiler-hlsl-size.md.
 const UNOPTIMISED_ABOVE_HLSL_BYTES: usize = 64 * 1024 * 1024;
-/// HLSL larger than this compiles at -O1 (was 1 MiB, rescaled the same way: every program that
-/// had -O1 keeps it).
-const LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES: usize = 520_000;
+/// HLSL larger than this compiles at -O1 (was 1 MiB while the HLSL carried a comment per
+/// instruction, four-space indentation, every SCC write and every EXEC select; rescaled so that
+/// every program of one retail pack that had -O1 keeps it: the smallest of them is 386 513 bytes
+/// now – calibration in docs/code/recompiler-hlsl-size.md, to be repeated when the emitter makes
+/// the text smaller again).
+const LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES: usize = 360_000;
 
 /// The DXC optimisation level for a source of this size when the caller names none (`None`:
 /// DXC's default, -O3).
@@ -518,6 +523,9 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // instructions) got 2.3× their DXIL at -O0 (21.3 MB vs 9.2 MB for a 29.6 MB source; DXC
     // 1.9 at -O1: 232 s, 3.2 GB peak), and NVIDIA's compiler went past 50 GB of commit on the
     // -O0 DXIL without finishing.
+    // The same 64 MB since the HLSL lost two thirds of its text (that source is 9.3 MB now):
+    // the level of those programs must not follow the size of the text back to -O0
+    // (`UNOPTIMISED_ABOVE_HLSL_BYTES`).
     if !extra.iter().any(|a| a.starts_with("-O")) {
         if let Some(level) = optimisation_level_for(src.len()) {
             args.push(crate::util::wide(level));
