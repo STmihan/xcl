@@ -1289,6 +1289,46 @@ fn gpu_memory_and_exports() {
     }
 }
 
+fn clock_wait_loop() -> Vec<u8> {
+    const WAITED_TICKS: u64 = 128 + 16;
+    const BACK_TO_SECOND_READ: u64 = 0xFFFB;
+    prog(&[
+        ("S_MEMTIME", "ENC_SMEM", &[("SDATA", 0)], None),
+        ("S_MEMTIME", "ENC_SMEM", &[("SDATA", 2)], None),
+        ("S_SUB_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 2), ("SSRC1", 0)], None),
+        ("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", WAITED_TICKS)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", BACK_TO_SECOND_READ)], None),
+        ("S_MEMREALTIME", "ENC_SMEM", &[("SDATA", 6)], None),
+    ])
+}
+
+#[test]
+fn clock_reads_advance_on_every_read() {
+    let t = translate(&clock_wait_loop(), &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("static uint64_t xcl_clock_reads = 0ull;"), "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("xcl_clock_reads += 1ull;").count(), 3, "{}", t.hlsl);
+    let no_clock = translate(&prog(&[("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 129)], None)]), &Options::default()).unwrap();
+    assert!(!no_clock.hlsl.contains("xcl_clock_reads"), "{}", no_clock.hlsl);
+}
+
+#[test]
+fn gpu_a_loop_waiting_for_the_clock_ends() {
+    let check = |r: &runner::KernelResult, form: &str| {
+        let time = |lo: usize| ((r.sgpr[lo + 1] as u64) << 32) | r.sgpr[lo] as u64;
+        assert!(r.sgpr[4] >= 16, "{form}: waited {} ticks", r.sgpr[4]);
+        assert!(time(2) > time(0) && time(6) > time(2), "{form}: {:x} {:x} {:x}", time(0), time(2), time(6));
+    };
+    for wave64 in gpu_waves() {
+        let (r, _) = run_wave(&clock_wait_loop(), &KernelState::default(), wave64);
+        check(&r, if wave64 { "wave64" } else { "wave32" });
+    }
+    if gpu_ready() {
+        let r = runner::run_code(&clock_wait_loop(), &KernelState::default(), &[]).unwrap();
+        check(&r, "wave64 on this adapter");
+    }
+}
+
 /// Multi-dword loads as the emitter groups them (four dwords per memory access, bounds checks
 /// without branches): an unaligned `s_load`, `s_buffer_load`s that straddle num_records, and
 /// vector buffer loads with lanes past the end and inactive lanes (which keep their registers).

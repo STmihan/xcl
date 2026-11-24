@@ -37,6 +37,7 @@ pub(super) struct Em {
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
     uses_scratch: bool,
+    reads_clock: bool,
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
     /// coherent scalar loads, 32: `ds_bpermute`)
     x64_words: usize,
@@ -530,6 +531,7 @@ impl Em {
             ps_done: false,
             uses_lds: false,
             uses_scratch: false,
+            reads_clock: false,
             x64_words: 1,
             x64_whole_live: BTreeMap::new(),
             dead_scc_writes: BTreeSet::new(),
@@ -1690,10 +1692,10 @@ impl Em {
 
     fn smem(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         if name == "s_memtime" || name == "s_memrealtime" {
-            // no clock in this model: a constant time (profiling deltas come out 0)
             let sdata = Self::field(d, "SDATA");
             let (lo, hi) = (self.sreg(sdata), self.sreg(sdata + 1));
-            self.line(&format!("{lo} = 0u; {hi} = 0u;"));
+            self.reads_clock = true;
+            self.line(&format!("{CLOCK_READS} += 1ull; {lo} = (uint){CLOCK_READS}; {hi} = (uint)({CLOCK_READS} >> 32);"));
             return Ok(());
         }
         let count: usize = match name.trim_start_matches("s_buffer_load_").trim_start_matches("s_load_") {
@@ -4495,6 +4497,9 @@ impl Em {
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
+        if self.reads_clock {
+            let _ = writeln!(h, "static uint64_t {CLOCK_READS} = 0ull;");
+        }
         if self.dynamic_f16_rm {
             h.push_str("static uint xcl_fp16_rm = 0u;\n");
         }
@@ -5471,6 +5476,8 @@ fn d16_merge(v: &str, raw: &str, n: u32, signed: bool, half: u32) -> String {
 }
 
 /// Per-lane private memory of scratch_* (static = thread-private in HLSL; 4 KB per lane).
+const CLOCK_READS: &str = "xcl_clock_reads";
+
 const PRELUDE_SCRATCH: &str = r#"
 static uint xcl_scratch[1024];
 uint scr_ld(uint a) { uint b = (a >> 2) & 1023u; uint s = (a & 3u) * 8u; uint lo = xcl_scratch[b]; uint hi = xcl_scratch[(b + 1u) & 1023u]; return select(s == 0u, lo, (lo >> s) | (hi << ((32u - s) & 31u))); }
