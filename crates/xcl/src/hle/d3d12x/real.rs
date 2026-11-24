@@ -1845,7 +1845,7 @@ fn empty_buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common:
     let d = unsafe { ID3D12Resource::from_raw_borrowed(&(res as *mut c_void)).map(|r| r.GetDesc()) };
     super::empty_views::Sample {
         res,
-        va: 0,
+        va: title_address(res).map_or(0, |a| a as u64),
         bytes: n as u64 * element,
         flags: d.map_or(0, |d| d.Flags.0 as u32),
         format: format.0 as u32,
@@ -1857,7 +1857,8 @@ fn empty_buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common:
 /// `empty_views::Sample` of a texture view whose shape is not known (`view_shape`).
 fn empty_texture_view(res: usize, d: &D3D12_RESOURCE_DESC, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, dimension: i32, slot: u32) -> super::empty_views::Sample {
     let format = if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { d.Format } else { format };
-    super::empty_views::Sample { res, va: 0, bytes: super::empty_views::texture_bytes(d, format), flags: d.Flags.0 as u32, format: format.0 as u32, dimension, slot }
+    let va = title_address(res).or_else(|| super::title_textures::address(res)).map_or(0, |a| a as u64);
+    super::empty_views::Sample { res, va, bytes: super::empty_views::texture_bytes(d, format), flags: d.Flags.0 as u32, format: format.0 as u32, dimension, slot }
 }
 
 fn note_buffer_view() {

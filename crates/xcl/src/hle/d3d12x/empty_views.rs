@@ -52,7 +52,8 @@ const PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
 pub struct Sample {
     /// the PC resource (raw pointer, 0 = none)
     pub res: usize,
-    /// its address where one is known without side effects (a CBV's, a BVH's), else 0
+    /// its address where one is known without side effects (a CBV's, a BVH's, a title address
+    /// XCL noted for the resource: `real::title_address`, `title_textures::address`), else 0
     pub va: u64,
     /// the bytes the view stands for (buffers: the view's or the resource's size; textures:
     /// texels × format size of the resource, approximate)
@@ -140,9 +141,9 @@ fn summary(last: &[u64; CAUSES.len()]) -> Vec<String> {
             .map(|s| format!("res {:#x} va {:#x} {} bytes flags {:#x} format {} dim {} slot {}", s.res, s.va, s.bytes, s.flags, s.format, s.dimension, s.slot))
             .collect();
         lines.push(format!(
-            "  {cause:?}: {count} (+{} in 2 s), {} MB; first: {}",
+            "  {cause:?}: {count} (+{} in 2 s), {} bytes; first: {}",
             count - last[k],
-            t.bytes.load(Ordering::Relaxed) >> 20,
+            t.bytes.load(Ordering::Relaxed),
             samples.join("; ")
         ));
     }
