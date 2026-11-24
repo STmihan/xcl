@@ -504,7 +504,8 @@ mod used_tests {
         let standin = 0x7E57_B006usize;
         let binding_thread = std::thread::current().id();
         let (tx, rx) = mpsc::channel();
-        submit_lazy(standin, true, Box::new(move || {
+        // a graphics pipeline: a compute one may be taken first by the workers that build ahead
+        submit_lazy(standin, false, Box::new(move || {
             let (mut lo, mut hi) = (0usize, 0usize);
             unsafe { GetCurrentThreadStackLimits(&mut lo, &mut hi) };
             let priority = unsafe { GetThreadPriority(GetCurrentThread()) };
