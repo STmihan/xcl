@@ -2530,6 +2530,16 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
 
+/// command list #129 / #130 (the newer layout's #131 / #132): the console's top- and
+/// bottom-of-pipe syncs a retail game puts between dependent passes (first calls
+/// `(0xc3c0, 0x80020000, 0, …)` and `(0x700000, 0, 0, …)`). Their flags are not decoded; as
+/// for #146 a global UAV barrier keeps the next pass from reading what the previous one has not
+/// written yet (as stubs they did nothing and the passes ran unordered). VIctory found the same
+/// slots and treats them the same way.
+pub(super) unsafe extern "system" fn pipeline_sync_x(this: *mut c_void, _a: u64, _b: u64, _c: u64) {
+    uav_barrier_x(this, 0, std::ptr::null());
+}
+
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
 pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
