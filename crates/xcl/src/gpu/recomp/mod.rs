@@ -57,6 +57,7 @@ pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod scc_liveness;
 pub mod x64_masks;
+pub mod predication;
 pub mod pso;
 pub use emit::mesh_passthrough;
 pub mod runner;
@@ -496,11 +497,23 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// which VGPR writes keep their EXEC predication (`predication`; `EveryWrite` also with
+    /// `XCL_RECOMP_PREDICATE_EVERY_WRITE` set)
+    pub lane_predication: LanePredication,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanePredication {
+    /// `v = select(lane active, value, v)` for every VALU result
+    EveryWrite,
+    /// compute programs: no select where the mask is full or the lanes outside it never read
+    /// the register again
+    WhereObservable,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true, lane_predication: LanePredication::WhereObservable }
     }
 }
 
@@ -1395,25 +1408,61 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             leaders.insert(next);
         }
     }
+    let traced = emit_program(&insts, opt, &starts, &leaders, branches, Predication::Traced);
+    let planned = match traced.em.lane_trace.as_ref().map(|trace| predication::plan(&insts, opt.wave64, trace)) {
+        Some(plan) if !plan.is_empty() => emit_program(&insts, opt, &starts, &leaders, branches, Predication::Planned(plan)),
+        _ => traced,
+    };
+    let Emitted { em, body, blocks } = planned;
+    let hlsl = em.finish(&body);
+    let static_samplers = em.static_used.clone();
+    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+}
+
+enum Predication {
+    Traced,
+    Planned(predication::Plan),
+}
+
+struct Emitted {
+    em: emit::Em,
+    body: String,
+    blocks: usize,
+}
+
+fn drops_unobservable_predication(opt: &Options) -> bool {
+    matches!(opt.mode, Mode::Compute(_)) && opt.lane_predication == LanePredication::WhereObservable && std::env::var_os("XCL_RECOMP_PREDICATE_EVERY_WRITE").is_none()
+}
+
+fn emit_program(insts: &[Decoded], opt: &Options, starts: &BTreeSet<u64>, leaders: &BTreeSet<u64>, branches: usize, predication: Predication) -> Emitted {
+    let gs_jump = match &opt.mode {
+        Mode::Geometry(g) => Some(g.gs_start.filter(|&s| s > 0)),
+        _ => None,
+    };
     let mut em = emit::Em::new(opt.clone());
-    em.configure_round_modes(&insts, branches == 0);
-    em.static_ss = constant_samplers(&insts, &leaders);
+    match predication {
+        Predication::Traced if drops_unobservable_predication(opt) => em.lane_trace = Some(Default::default()),
+        Predication::Traced => {}
+        Predication::Planned(plan) => em.predication = plan,
+    }
+    em.configure_round_modes(insts, branches == 0);
+    em.static_ss = constant_samplers(insts, leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is)
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        em.x64_whole_live = x64_masks::by_pc(insts, matches!(opt.mode, Mode::Kernel));
     }
     // SCC writes nothing reads are left out of kernel / compute / mesh programs (the modes
     // `x64_masks` covers; VS / PS / GS are left as they are); `XCL_RECOMP_ALL_SCC=1` keeps
     // them all
     if matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_RECOMP_ALL_SCC").is_none() {
-        em.dead_scc_writes = scc_liveness::dead_writes(&insts, matches!(opt.mode, Mode::Kernel));
+        em.dead_scc_writes = scc_liveness::dead_writes(insts, matches!(opt.mode, Mode::Kernel));
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
     // program with a read to change gets the form
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
-        let a = upper_lanes::analyze(&insts);
+        let a = upper_lanes::analyze(insts);
         if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
             em.upper = Some(a);
         }
@@ -1427,7 +1476,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         .max()
         .unwrap_or(0);
     if let Mode::Pixel(ps) = &opt.mode {
-        em.ps_modes = emit::ps_attr_modes(&insts, ps.input_ena);
+        em.ps_modes = emit::ps_attr_modes(insts, ps.input_ena);
     }
     let mut body = String::new();
     let mut blocks = 0usize;
@@ -1448,10 +1497,10 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // (`while (pc in range)`); ranges are merged until they nest. Same semantics as a
         // dispatcher loop over all blocks, but DXC sees an acyclic graph almost everywhere
         // (optimising one big dispatcher loop took minutes on large retail programs).
-        let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
-        let loops = loop_ranges(&insts);
+        let leaders: Vec<u64> = leaders.iter().copied().filter(|l| starts.contains(l)).collect();
+        let loops = loop_ranges(insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
+        let ctx = Ctx { insts, starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
         let nested = nested_loop_ranges(&insts);
@@ -1473,9 +1522,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
         body.push_str(&code);
     }
-    let hlsl = em.finish(&body);
-    let static_samplers = em.static_used.clone();
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+    Emitted { em, body, blocks }
 }
 
 #[cfg(test)]
