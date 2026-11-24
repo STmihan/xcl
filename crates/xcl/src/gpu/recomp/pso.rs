@@ -256,12 +256,22 @@ mod translated {
         b.iter().fold(0x9E37_79B9_7F4A_7C15u64, |h, &x| (h ^ x as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29))
     }
 
-    /// `compact`: the program went to the compact backend (`CompactCs`): `_c` before `.bin`.
+    /// `_c` for a program that went to the compact backend (`CompactCs`), then `_n<P>` when it
+    /// switches in two levels (`XCL_COMPACT_NEST`); nothing otherwise.
+    pub(super) fn compact_tag(compact: bool, nest: usize) -> String {
+        match (compact, nest) {
+            (false, _) => String::new(),
+            (true, 0) => "_c".to_string(),
+            (true, n) => format!("_c_n{n}"),
+        }
+    }
+
+    /// `compact`: the program went to the compact backend (`CompactCs`): `compact_tag` before `.bin`.
     pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool, compact: bool) -> PathBuf {
         dir.join("translated")
             .join("v2")
             .join(format!("{ident:016x}"))
-            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}{}.bin", crate::gpu::shader::fnv64(blob), split as u8, if compact { "_c" } else { "" }))
+            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}{}.bin", crate::gpu::shader::fnv64(blob), split as u8, compact_tag(compact, super::super::compact::nest_from_env())))
     }
 
     fn header(ident: u64, blob: &[u8]) -> Vec<u8> {
@@ -1109,7 +1119,10 @@ mod shader_cache_tests {
         let (blob, ident) = (b"console", 42);
         let normal = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, false);
         assert_eq!(normal.file_name().unwrap().to_string_lossy(), format!("{:016x}_Compute_0_1_0.bin", crate::gpu::shader::fnv64(blob)));
-        assert_eq!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, true).file_name().unwrap().to_string_lossy(), format!("{:016x}_Compute_0_1_0_c.bin", crate::gpu::shader::fnv64(blob)));
+        assert_eq!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, true).file_name().unwrap().to_string_lossy(), format!("{:016x}_Compute_0_1_0{}.bin", crate::gpu::shader::fnv64(blob), translated::compact_tag(true, super::super::compact::nest_from_env())));
+        assert_eq!(translated::compact_tag(true, 0), "_c");
+        assert_eq!(translated::compact_tag(true, 32), "_c_n32");
+        assert_eq!(translated::compact_tag(false, 32), "");
         let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || Ok(compiled(1))).unwrap();
         let compact = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, true, || Ok(compiled(2))).unwrap();
         assert_eq!((first.dxil[0], compact.dxil[0]), (1, 2), "the compact form did not reuse the normal entry");

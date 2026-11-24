@@ -161,9 +161,38 @@ fn blocks(insts: &[rdna2::Decoded], leaders: &BTreeSet<u64>, em: &mut emit::Em, 
     Ok(out)
 }
 
+/// `XCL_COMPACT_NEST=<P>`: the dispatch loop switches in two levels, on `case >> log2(P)` and
+/// then inside the group of P cases (`compact_with`). A power of two up to `MAX_NEST`; unset or
+/// `0`: one switch over all cases. Anything else warns and leaves it off. Read once.
+pub(super) fn nest_from_env() -> usize {
+    static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let Ok(v) = std::env::var("XCL_COMPACT_NEST") else { return 0 };
+        parse_nest(&v).unwrap_or_else(|| {
+            crate::xlog_warn!("[SHADER] XCL_COMPACT_NEST={v:?} is not 0 or a power of two up to {MAX_NEST} – off");
+            0
+        })
+    })
+}
+
+/// The group size of the two-level dispatch is at most this: a shift of 32 or more is masked
+/// by HLSL to a shift of 0.
+const MAX_NEST: usize = 1 << 16;
+
+fn parse_nest(v: &str) -> Option<usize> {
+    v.trim().parse::<usize>().ok().filter(|&p| p == 0 || (p.is_power_of_two() && p <= MAX_NEST))
+}
+
 /// `translate_compact` with the bound `heavy` (`HEAVY`); a table of more than `dense_above`
 /// words is packed across words.
 pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usize) -> Result<Translation, String> {
+    compact_with(code, opt, heavy, dense_above, nest_from_env())
+}
+
+/// `compact` with the group size of the two-level dispatch given (`nest_from_env`; 0 = flat).
+/// DXC folds the groups' exits back into one merge block with a phi operand per case unless
+/// each group ends in `xcl_nb = min(xcl_nb, n)`, which it cannot see through.
+pub(super) fn compact_with(code: &[u8], opt: &Options, heavy: usize, dense_above: usize, nest: usize) -> Result<Translation, String> {
     if matches!(opt.mode, Mode::Geometry(_)) {
         return Err("compact form: geometry programs are not supported".into());
     }
@@ -218,9 +247,8 @@ pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usi
             off
         } else {
             let _ = writeln!(text, "            uint xcl_t = {off};");
-            for &(k, to) in targets[c].iter().filter(|&&(k, to)| to as i64 - k as i64 != d) {
-                let _ = writeln!(text, "            xcl_t = select(xcl_b == {k}u, {to}u, xcl_t);");
-            }
+            let minority: Vec<(usize, usize)> = targets[c].iter().copied().filter(|&(k, to)| to as i64 - k as i64 != d).collect();
+            pick_targets(text, &minority, MAX_SELECTS, 0);
             "xcl_t".to_string()
         };
         let _ = if cond.is_empty() { writeln!(text, "            xcl_nb = {nb};") } else { writeln!(text, "            if ({cond}) xcl_nb = {nb};") };
@@ -253,14 +281,28 @@ pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usi
     }
     body.push_str("    };\n    uint xcl_b = 0u;\n    [loop] for (;;) {\n        uint xcl_nb = xcl_b + 1u;\n");
     let mask = (1u64 << bits) - 1;
-    if dense {
+    let selector = if dense {
         let _ = writeln!(body, "        uint xcl_p = xcl_b * {bits}u;");
-        let _ = writeln!(body, "        switch (((XCL_BT[xcl_p >> 5u] >> (xcl_p & 31u)) | ((XCL_BT[(xcl_p >> 5u) + 1u] << 1u) << (31u - (xcl_p & 31u)))) & {mask:#x}u) {{");
+        format!("((XCL_BT[xcl_p >> 5u] >> (xcl_p & 31u)) | ((XCL_BT[(xcl_p >> 5u) + 1u] << 1u) << (31u - (xcl_p & 31u)))) & {mask:#x}u")
     } else {
-        let _ = writeln!(body, "        switch ((XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask:#x}u) {{");
-    }
-    for (k, (text, pc)) in texts.iter().enumerate() {
-        let _ = write!(body, "        case {k}u: {{ // {pc:x}\n{text}        }} break;\n");
+        format!("(XCL_BT[xcl_b / {per}u] >> (xcl_b % {per}u * {bits}u)) & {mask:#x}u")
+    };
+    if nest > 0 {
+        let _ = writeln!(body, "        uint xcl_c = {selector};");
+        let _ = writeln!(body, "        switch (xcl_c >> {}u) {{", nest.trailing_zeros());
+        for (g, group) in texts.chunks(nest).enumerate() {
+            let _ = writeln!(body, "        case {g}u: switch (xcl_c) {{");
+            for (j, (text, pc)) in group.iter().enumerate() {
+                let _ = write!(body, "        case {}u: {{ // {pc:x}\n{text}        }} break;\n", g * nest + j);
+            }
+            let _ = writeln!(body, "        default: xcl_nb = 0xFFFFFFFFu; break;");
+            let _ = writeln!(body, "        }} xcl_nb = min(xcl_nb, {n}u); break;");
+        }
+    } else {
+        let _ = writeln!(body, "        switch ({selector}) {{");
+        for (k, (text, pc)) in texts.iter().enumerate() {
+            let _ = write!(body, "        case {k}u: {{ // {pc:x}\n{text}        }} break;\n");
+        }
     }
     body.push_str("        default: xcl_nb = 0xFFFFFFFFu; break;\n        }\n");
     let _ = writeln!(body, "        if (xcl_nb >= {n}u) break;");
@@ -280,6 +322,29 @@ pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usi
         blocks: texts.len(),
         static_samplers,
     })
+}
+
+/// The most selects a case evaluates for its branch target; a longer list is searched through
+/// a tree on the block index first.
+pub(super) const MAX_SELECTS: usize = 32;
+
+/// The lines that set `xcl_t` for the blocks of `list` (block, target; sorted by block): one
+/// select each, or, past `max`, a `[branch] if (xcl_b < pivot)` that picks the half of the list
+/// holding the block (`xcl_b` is wave-uniform, so is the branch).
+fn pick_targets(text: &mut String, list: &[(usize, usize)], max: usize, depth: usize) {
+    let pad = " ".repeat(12 + 4 * depth);
+    if list.len() <= max {
+        for &(k, to) in list {
+            let _ = writeln!(text, "{pad}xcl_t = select(xcl_b == {k}u, {to}u, xcl_t);");
+        }
+        return;
+    }
+    let mid = (list.len().div_ceil(max) / 2) * max;
+    let _ = writeln!(text, "{pad}[branch] if (xcl_b < {}u) {{", list[mid].0);
+    pick_targets(text, &list[..mid], max, depth + 1);
+    let _ = writeln!(text, "{pad}}} else {{");
+    pick_targets(text, &list[mid..], max, depth + 1);
+    let _ = writeln!(text, "{pad}}}");
 }
 
 #[cfg(test)]
@@ -334,12 +399,52 @@ mod tests {
         ])
     }
 
+    /// The two-level dispatch: `ceil(cases / P)` inner switches, every case once, one `min` per
+    /// group; with the nest off the text is the flat one.
+    #[test]
+    fn nested_dispatch_groups_the_cases() {
+        let code = guarded();
+        let opt = Options::default();
+        // every instruction a block of its own: enough cases for several groups
+        let flat = compact_with(&code, &opt, 0, MAX_TABLE_WORDS, 0).unwrap();
+        let cases = flat.hlsl.matches("u: { // ").count();
+        assert!(cases >= 9, "{}", flat.hlsl);
+        assert!(!flat.hlsl.contains("xcl_c") && !flat.hlsl.contains("min(xcl_nb") && flat.hlsl.contains("        switch ((XCL_BT[xcl_b / "), "{}", flat.hlsl);
+        let at = flat.hlsl.find("        if (xcl_nb >= ").unwrap() + "        if (xcl_nb >= ".len();
+        let n: usize = flat.hlsl[at..at + flat.hlsl[at..].find("u) break;").unwrap()].parse().unwrap();
+        for p in [2usize, 4, 8, 16] {
+            let t = compact_with(&code, &opt, 0, MAX_TABLE_WORDS, p).unwrap();
+            let groups = cases.div_ceil(p);
+            let h = &t.hlsl;
+            assert_eq!(h.matches("u: switch (xcl_c) {").count(), groups, "P = {p}: inner switches");
+            assert_eq!(h.matches(&format!("switch (xcl_c >> {}u) {{", p.trailing_zeros())).count(), 1, "P = {p}");
+            assert_eq!(h.matches(&format!("xcl_nb = min(xcl_nb, {n}u); break;")).count(), groups, "P = {p}: min per group");
+            assert_eq!(h.matches("min(xcl_nb").count(), groups, "P = {p}");
+            for k in 0..cases {
+                assert_eq!(h.matches(&format!("        case {k}u: {{ // ")).count(), 1, "P = {p}: case {k}");
+            }
+            assert_eq!(h.matches("u: { // ").count(), cases, "P = {p}");
+            assert_eq!(h.matches("default: xcl_nb = 0xFFFFFFFFu; break;").count(), groups + 1, "P = {p}: a default per group and the outer one");
+            assert!(t.complete() && t.blocks == flat.blocks && t.instructions == flat.instructions, "P = {p}");
+        }
+        // packed across words as well
+        let dense = compact_with(&code, &opt, 0, 0, 4).unwrap();
+        assert!(dense.hlsl.contains("uint xcl_p = xcl_b * ") && dense.hlsl.contains("uint xcl_c = ((XCL_BT[xcl_p >> 5u]"), "{}", dense.hlsl);
+    }
+
+    #[test]
+    fn the_nest_size_is_zero_or_a_power_of_two_up_to_the_limit() {
+        for (v, want) in [("0", Some(0)), ("1", Some(1)), (" 32 ", Some(32)), ("65536", Some(65536)), ("131072", None), ("4294967296", None), ("48", None), ("-1", None), ("x", None), ("", None)] {
+            assert_eq!(parse_nest(v), want, "{v:?}");
+        }
+    }
+
     #[test]
     fn equal_blocks_share_one_case() {
         let code = guarded();
         let t = translate_compact(&code, &Options::default()).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
-        assert!(t.hlsl.contains("switch ((XCL_BT[xcl_b / ") && t.hlsl.contains("static const uint XCL_BT[1]"), "{}", t.hlsl);
+        assert!(t.hlsl.contains("(XCL_BT[xcl_b / ") && t.hlsl.contains("static const uint XCL_BT[1]"), "{}", t.hlsl);
         // blocks: 0, 8, 24, 40, 52, 64, 76, 88, 92; 40 and 64 are the same code
         assert_eq!(t.blocks, 8, "{}", t.hlsl);
         assert_eq!(t.hlsl.matches("v3 = select(").count(), 1, "{}", t.hlsl);
