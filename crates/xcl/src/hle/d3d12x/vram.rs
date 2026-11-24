@@ -260,7 +260,7 @@ struct Pages {
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
-    pools: Vec<ID3D12Heap>,
+    pools: Vec<Option<ID3D12Heap>>,
     free: Vec<Tile>,
     /// tiles given back, reusable after `COOL`
     cooling: std::collections::VecDeque<(Tile, std::time::Instant)>,
@@ -313,9 +313,10 @@ impl Pages {
         })
     }
 
-    /// Pages no resource used for `IDLE` go back to the pools.
+    /// Sweep idle pages, drain cooled tiles and release excess completely free pool heaps.
     fn sweep(&mut self, now: std::time::Instant) {
         sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.cooling, now);
+        release_empty_pools(&mut self.pools, &mut self.free, &mut self.cooling, now);
     }
 
     unsafe fn take_tile(&mut self, dev: &ID3D12Device) -> Option<Tile> {
@@ -354,8 +355,7 @@ impl Pages {
             crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
             return None;
         }
-        self.pools.push(heap?);
-        let h = self.pools.len() as u32 - 1;
+        let h = insert_pool(&mut self.pools, heap?);
         self.free.extend((1..POOL_PAGES).rev().map(|t| (h, t)));
         Some((h, 0))
     }
@@ -377,7 +377,7 @@ impl Pages {
                 1,
                 Some(&coord),
                 Some(&region),
-                &self.pools[h as usize],
+                self.pools[h as usize].as_ref(),
                 ranges.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -538,6 +538,51 @@ impl Pages {
         }
         self.map(res, &tiles);
         Some((used, used_extra))
+    }
+}
+
+/// Place `heap` in the first vacated pool slot, or append a new slot.
+fn insert_pool<H>(pools: &mut Vec<Option<H>>, heap: H) -> u32 {
+    match pools.iter().position(Option::is_none) {
+        Some(i) => {
+            pools[i] = Some(heap);
+            i as u32
+        }
+        None => {
+            pools.push(Some(heap));
+            pools.len() as u32 - 1
+        }
+    }
+}
+
+/// Move expired cooling tiles back to `free` and drop any excess pool heap whose all `POOL_PAGES`
+/// tiles are free, keeping at least one live pool warm to avoid heap-creation thrashing.
+fn release_empty_pools<H>(pools: &mut [Option<H>], free: &mut Vec<Tile>, cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>, now: std::time::Instant) {
+    while cooling.front().is_some_and(|(_, at)| now.saturating_duration_since(*at) >= COOL) {
+        if let Some((t, _)) = cooling.pop_front() {
+            free.push(t);
+        }
+    }
+    let mut live = pools.iter().filter(|h| h.is_some()).count();
+    if free.len() < POOL_PAGES as usize || live <= 1 {
+        return;
+    }
+    let mut counts = vec![0u32; pools.len()];
+    for &(h, _) in free.iter() {
+        if let Some(c) = counts.get_mut(h as usize) {
+            *c += 1;
+        }
+    }
+    let mut dropped = false;
+    for (h, &c) in counts.iter().enumerate() {
+        if c == POOL_PAGES && pools[h].is_some() && live > 1 {
+            pools[h] = None;
+            live -= 1;
+            dropped = true;
+        }
+    }
+    if dropped {
+        free.retain(|&(h, _)| pools.get(h as usize).is_some_and(Option::is_some));
     }
 }
 
@@ -761,14 +806,14 @@ pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     let Some(Some(p)) = g.get(&device) else { return (0, 0) };
-    ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
+    ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.iter().filter(|h| h.is_some()).count() * POOL_PAGES as usize * PAGE)
 }
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     g.values().flatten().fold((0, 0), |(used, pools), p| {
-        (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
+        (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.iter().filter(|h| h.is_some()).count() * POOL_PAGES as usize * PAGE)
     })
 }
 
@@ -934,6 +979,42 @@ mod tests {
         }
         assert!(t.elapsed() < Duration::from_secs(2), "{:?} for 20 000 sweeps", t.elapsed());
         assert_eq!(pages.len(), 199_998);
+    }
+
+    /// Empty 64 MiB tile pools are released once their tiles finish cooling, at least one pool
+    /// stays warm, and newly allocated pools reuse vacated slots.
+    #[test]
+    fn empty_tile_pools_are_released_after_cooling_and_slots_reused() {
+        let t0 = Instant::now();
+        let mut pools: Vec<Option<u32>> = Vec::new();
+        assert_eq!(insert_pool(&mut pools, 10), 0);
+        assert_eq!(insert_pool(&mut pools, 20), 1);
+        assert_eq!(insert_pool(&mut pools, 30), 2);
+        // Pool 0 has 1 tile in use; pool 1 is cooling; pool 2 is completely free.
+        let mut free: Vec<Tile> = (1..POOL_PAGES).map(|t| (0, t)).chain((0..POOL_PAGES).map(|t| (2, t))).collect();
+        let mut cooling: std::collections::VecDeque<(Tile, Instant)> = (0..POOL_PAGES).map(|t| ((1, t), t0)).collect();
+
+        // Before COOL elapses: pool 2 drops, pool 1 stays while cooling, pool 0 stays (1 tile live).
+        release_empty_pools(&mut pools, &mut free, &mut cooling, t0 + COOL - Duration::from_millis(1));
+        assert_eq!(pools, vec![Some(10), Some(20), None]);
+        assert!(free.iter().all(|&(h, _)| h == 0) && free.len() == POOL_PAGES as usize - 1);
+        assert_eq!(cooling.len(), POOL_PAGES as usize);
+
+        // Once COOL elapses: pool 1 drains from cooling and drops; pool 0 stays.
+        release_empty_pools(&mut pools, &mut free, &mut cooling, t0 + COOL);
+        assert_eq!(pools, vec![Some(10), None, None]);
+        assert!(cooling.is_empty());
+        assert_eq!(free.len(), POOL_PAGES as usize - 1);
+
+        // Even when pool 0's last tile returns, one warm pool is kept.
+        free.push((0, 0));
+        release_empty_pools(&mut pools, &mut free, &mut cooling, t0 + COOL + Duration::from_secs(1));
+        assert_eq!(pools, vec![Some(10), None, None]);
+        assert_eq!(free.len(), POOL_PAGES as usize);
+
+        // A new pool reuses the first vacated slot instead of growing the vec.
+        assert_eq!(insert_pool(&mut pools, 40), 1);
+        assert_eq!(pools, vec![Some(10), Some(40), None]);
     }
 
     /// Any 64 KiB page boundary inside `[va, va + bytes)` belongs to that range alone, so
