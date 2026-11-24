@@ -85,6 +85,7 @@ pub fn backend() -> Backend {
             Ok(desc) => {
                 crate::xlog_info!("D3D12.X: backend 'real' – {desc}");
                 pso_async::check_frame_budget();
+                wait_trace::on();
                 Backend::Real
             }
             Err(e) => {

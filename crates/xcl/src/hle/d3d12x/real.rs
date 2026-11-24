@@ -4391,11 +4391,21 @@ mod shaders_key_tests {
 
 impl OwnedDesc {
     fn shaders_key(&self) -> u64 {
-        shaders_key(match self {
+        shaders_key(self.blobs())
+    }
+
+    /// each shader's record hash (`fnv64` of its container, as "driver compile start … record"
+    /// and `[SHADER]` lines give it) – `XCL_WAIT_TRACE`
+    fn record_hashes(&self) -> Vec<u64> {
+        self.blobs().iter().map(|b| crate::gpu::shader::fnv64(b)).collect()
+    }
+
+    fn blobs(&self) -> &[Vec<u8>] {
+        match self {
             OwnedDesc::Compute(_, b) => b,
             OwnedDesc::Graphics(_, b, ..) => b,
             OwnedDesc::Stream(_, _, b) => b,
-        })
+        }
     }
 
     fn ptr(&self) -> *const c_void {
@@ -4540,6 +4550,9 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    if super::wait_trace::on() {
+        super::wait_trace::note_records(*ppv as usize, owned.record_hashes());
+    }
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
@@ -5521,7 +5534,7 @@ pub(super) fn note_newer_device_method(slot: usize) {
 }
 
 /// Whether `p` is a fence the title created.
-fn is_fence(p: usize) -> bool {
+pub(super) fn is_fence(p: usize) -> bool {
     p != 0 && FENCES.read().unwrap_or_else(|e| e.into_inner()).contains(&p)
 }
 

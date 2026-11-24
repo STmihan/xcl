@@ -125,24 +125,77 @@ pub enum SkipKind {
     Dispatch,
 }
 
-/// A root argument that is an address: a root CBV/SRV/UAV (64-bit) or a descriptor table (32-bit).
+/// descriptors of a table read at a skip (the first ones; which of them the shader writes is not
+/// known)
+const TABLE_VIEWS: usize = 4;
+
+/// A console descriptor (8 words) as read from a console heap slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    /// all zeros
+    Empty,
+    /// a T#: word 0 holds the PC heap index (`console_heap::copy_words`)
+    Image(u32),
+    /// a buffer V#: its address and bytes (records × stride, or records when the stride is 0)
+    Buffer { va: u64, bytes: u64 },
+    /// the table address is not in a console heap
+    Unknown,
+}
+
+impl View {
+    pub fn from_words(w: [u32; 8]) -> View {
+        const IMAGE_TYPE_SHIFT: u32 = 28;
+        const FIRST_IMAGE_TYPE: u32 = 8;
+        const BASE_HI_MASK: u32 = 0xFFFF;
+        const STRIDE_SHIFT: u32 = 16;
+        const STRIDE_MASK: u32 = 0x3FFF;
+        if w.iter().all(|&x| x == 0) {
+            View::Empty
+        } else if w[3] >> IMAGE_TYPE_SHIFT >= FIRST_IMAGE_TYPE {
+            View::Image(w[0])
+        } else {
+            let va = w[0] as u64 | (((w[1] & BASE_HI_MASK) as u64) << 32);
+            let stride = (w[1] >> STRIDE_SHIFT) & STRIDE_MASK;
+            let bytes = w[2] as u64 * stride.max(1) as u64;
+            View::Buffer { va, bytes }
+        }
+    }
+}
+
+impl std::fmt::Display for View {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            View::Empty => write!(f, "empty"),
+            View::Image(index) => write!(f, "image#{index}"),
+            View::Buffer { va, bytes } => write!(f, "buf {va:#x}+{bytes:#x}"),
+            View::Unknown => write!(f, "?"),
+        }
+    }
+}
+
+/// A root argument that is an address: a root CBV/SRV/UAV (64-bit) or a descriptor table
+/// (32-bit, with its first descriptors as read at the skip).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Root {
     Descriptor(u64),
-    Table(u32),
+    Table(u32, Vec<View>),
 }
 
 impl std::fmt::Display for Root {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Root::Descriptor(va) => write!(f, "d:{va:#x}"),
-            Root::Table(at) => write!(f, "t:{at:#x}"),
+            Root::Table(at, views) => {
+                let views: Vec<String> = views.iter().map(ToString::to_string).collect();
+                write!(f, "t:{at:#x}{{{}}}", views.join(", "))
+            }
         }
     }
 }
 
-/// The address-valued root arguments of `args` packed by `layout`.
-pub fn roots(layout: Option<&Layout>, args: &[u8]) -> Vec<Root> {
+/// The address-valued root arguments of `args` packed by `layout`, tables resolved through
+/// `read` (the descriptor at a table address).
+pub fn roots_with(layout: Option<&Layout>, args: &[u8], read: impl Fn(u32) -> Option<[u32; 8]>) -> Vec<Root> {
     let Some(layout) = layout else { return Vec::new() };
     let word = |at: u32, n: usize| args.get(at as usize..at as usize + n);
     layout
@@ -150,17 +203,57 @@ pub fn roots(layout: Option<&Layout>, args: &[u8]) -> Vec<Root> {
         .iter()
         .filter_map(|p| match *p {
             Param::Descriptor { at } => word(at, 8).map(|b| Root::Descriptor(u64::from_le_bytes(b.try_into().unwrap()))),
-            Param::Table { at } => word(at, 4).map(|b| Root::Table(u32::from_le_bytes(b.try_into().unwrap()))),
+            Param::Table { at } => word(at, 4).map(|b| {
+                let table = u32::from_le_bytes(b.try_into().unwrap());
+                let views = (0..TABLE_VIEWS as u32)
+                    .map(|k| read(table.wrapping_add(k * super::console_heap::SLOT)).map_or(View::Unknown, View::from_words))
+                    .collect();
+                Root::Table(table, views)
+            }),
             Param::Constants { .. } => None,
         })
         .take(ROOTS_PER_PIPELINE)
         .collect()
 }
 
+/// `roots_with` the console heaps.
+pub fn roots(layout: Option<&Layout>, args: &[u8]) -> Vec<Root> {
+    roots_with(layout, args, super::console_heap::words_at)
+}
+
+/// stand-in pipelines → their console shaders' record hashes (`fnv64` of each container, as in
+/// "driver compile start … record" and `[SHADER]` lines)
+static RECORDS: Mutex<Option<HashMap<usize, Vec<u64>>>> = Mutex::new(None);
+/// stand-ins remembered at most (a retail title makes ~51 000 pipelines in its first 30 s)
+const MAX_RECORDS: usize = 1 << 18;
+
+/// Stand-in `pso` is built from console shaders with these record hashes (call only when `on()`).
+pub fn note_records(pso: usize, records: Vec<u64>) {
+    let mut g = RECORDS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() >= MAX_RECORDS {
+        m.clear();
+    }
+    m.insert(pso, records);
+}
+
+fn records_of(pso: usize) -> Vec<u64> {
+    RECORDS.lock().unwrap().as_ref().and_then(|m| m.get(&pso).cloned()).unwrap_or_default()
+}
+
+fn hashes(v: &[u64]) -> String {
+    v.iter().map(|h| format!("{h:016x}")).collect::<Vec<_>>().join(",")
+}
+
+/// one line per distinct pipeline at its first skip, at most this many
+const FIRST_SKIP_LINES: usize = 2048;
+static FIRST_SKIPPED: Mutex<Option<HashSet<(usize, SkipWhy)>>> = Mutex::new(None);
+
 #[derive(Debug, PartialEq, Eq)]
 struct PipelineSkips {
     pso: usize,
     key: u64,
+    records: Vec<u64>,
     why: SkipWhy,
     count: u64,
     roots: Vec<Root>,
@@ -176,7 +269,7 @@ struct ListSkips {
 }
 
 impl ListSkips {
-    fn add(&mut self, kind: SkipKind, why: SkipWhy, pso: usize, key: u64, roots: Vec<Root>) {
+    fn add(&mut self, kind: SkipKind, why: SkipWhy, pso: usize, key: u64, records: Vec<u64>, roots: Vec<Root>) {
         match kind {
             SkipKind::Draw => self.draws += 1,
             SkipKind::Dispatch => self.dispatches += 1,
@@ -189,7 +282,7 @@ impl ListSkips {
                 }
             }
         } else if self.pipelines.len() < PIPELINES_PER_LINE {
-            self.pipelines.push(PipelineSkips { pso, key, why, count: 1, roots });
+            self.pipelines.push(PipelineSkips { pso, key, records, why, count: 1, roots });
         } else {
             self.more += 1;
         }
@@ -216,7 +309,7 @@ impl ListSkips {
             .iter()
             .map(|p| {
                 let roots: Vec<String> = p.roots.iter().map(ToString::to_string).collect();
-                format!("pso {:#x} key {:016x} x{} [{}] roots [{}]", p.pso, p.key, p.count, p.why.tag(), roots.join(" "))
+                format!("pso {:#x} key {:016x} records [{}] x{} [{}] roots [{}]", p.pso, p.key, hashes(&p.records), p.count, p.why.tag(), roots.join(" "))
             })
             .collect();
         if self.more > 0 {
@@ -235,16 +328,38 @@ static SKIPPED_LISTS: AtomicU64 = AtomicU64::new(0);
 /// A draw or dispatch recorded on `list` was skipped (call only when `on()`).
 pub fn note_skip(list: *mut c_void, kind: SkipKind, why: SkipWhy, pso: usize, roots: Vec<Root>) {
     let key = super::pso_async::trace_key(pso);
+    let records = records_of(pso);
     match kind {
         SkipKind::Draw => SKIPPED_DRAWS.fetch_add(1, Ordering::Relaxed),
         SkipKind::Dispatch => SKIPPED_DISPATCHES.fetch_add(1, Ordering::Relaxed),
     };
+    let first = {
+        let mut g = FIRST_SKIPPED.lock().unwrap();
+        let s = g.get_or_insert_with(HashSet::new);
+        s.len() < FIRST_SKIP_LINES && s.insert((pso, why))
+    };
+    if first {
+        let roots: Vec<String> = roots.iter().map(ToString::to_string).collect();
+        crate::xlog_info!(
+            "wait-trace: first skip of pso {pso:#x} key {key:016x} records [{}] [{}]: a {} on list {:#x} at frame {} (submit #{} so far): roots [{}]",
+            hashes(&records),
+            why.tag(),
+            match kind {
+                SkipKind::Draw => "draw",
+                SkipKind::Dispatch => "dispatch",
+            },
+            list as usize,
+            FRAMES.load(Ordering::Relaxed),
+            SUBMITS.load(Ordering::Relaxed),
+            roots.join(" ")
+        );
+    }
     let mut g = SKIPS.lock().unwrap();
     let m = g.get_or_insert_with(HashMap::new);
     if m.len() >= MAX_TRACKED && !m.contains_key(&(list as usize)) {
         m.clear();
     }
-    m.entry(list as usize).or_default().add(kind, why, pso, key, roots);
+    m.entry(list as usize).or_default().add(kind, why, pso, key, records, roots);
 }
 
 /// `titles` (mapped to the PC lists `mapped`) went to `queue` (call only when `on()`).
@@ -534,7 +649,7 @@ unsafe fn observe() -> (Vec<Observed>, Vec<String>) {
         });
     }
     let mut lagging = Vec::new();
-    for f in super::fence_x::snapshot() {
+    for f in super::fence_x::snapshot(super::real::is_fence) {
         if f.done >= f.signalled && f.done >= f.waited {
             continue;
         }
@@ -569,10 +684,10 @@ fn reporter() {
             crate::xlog_warn!("wait-trace: stuck {} ms: {d}", age.as_millis());
         }
         for d in &look.moved_on {
-            crate::xlog_info!("wait-trace: moved on: {d}");
+            crate::xlog_info!("wait-trace: no longer pending: {d}");
         }
         let idle = start().elapsed().saturating_sub(Duration::from_millis(LAST_SUBMIT_MS.load(Ordering::Relaxed)));
-        if tracker.idle_due(now, idle) {
+        if SUBMITS.load(Ordering::Relaxed) > 0 && tracker.idle_due(now, idle) {
             crate::xlog_warn!(
                 "wait-trace: idle {} ms: nothing submitted since submit #{} (frame {}); {} stuck waits, {} lagging title fences",
                 idle.as_millis(),
@@ -631,27 +746,44 @@ mod tests {
         let mut args = vec![0u8; 20];
         args[8..16].copy_from_slice(&0x1_2345_6780u64.to_le_bytes());
         args[16..20].copy_from_slice(&0x40u32.to_le_bytes());
-        assert_eq!(roots(Some(&layout), &args), vec![Root::Descriptor(0x1_2345_6780), Root::Table(0x40)]);
-        assert_eq!(roots(None, &args), vec![]);
-        assert_eq!(roots(Some(&layout), &args[..12]), vec![]);
+        let buffer = [0x1000, 0x0010_0002, 4, 0, 0, 0, 0, 0];
+        let read = |at: u32| match at {
+            0x40 => Some(buffer),
+            0x60 => Some([0; 8]),
+            _ => None,
+        };
+        let views = vec![View::Buffer { va: 0x2_0000_1000, bytes: 64 }, View::Empty, View::Unknown, View::Unknown];
+        assert_eq!(roots_with(Some(&layout), &args, read), vec![Root::Descriptor(0x1_2345_6780), Root::Table(0x40, views)]);
+        assert_eq!(roots_with(None, &args, read), vec![]);
+        assert_eq!(roots_with(Some(&layout), &args[..12], read), vec![]);
+        assert_eq!(Root::Table(0x40, vec![View::Image(7), View::Empty]).to_string(), "t:0x40{image#7, empty}");
+    }
+
+    #[test]
+    fn a_descriptor_is_an_image_a_buffer_or_empty() {
+        const IMAGE_2D: u32 = 9 << 28;
+        assert_eq!(View::from_words([0; 8]), View::Empty);
+        assert_eq!(View::from_words([42, 0, 0, IMAGE_2D, 0, 0, 0, 0]), View::Image(42));
+        assert_eq!(View::from_words([0x100, 0x1, 0x30, 0x1000, 0, 0, 0, 0]), View::Buffer { va: 0x1_0000_0100, bytes: 0x30 });
+        assert_eq!(View::from_words([0x100, 0x000C_0001, 0x10, 0x1000, 0, 0, 0, 0]), View::Buffer { va: 0x1_0000_0100, bytes: 0xC0 });
     }
 
     #[test]
     fn list_skips_group_by_pipeline_and_cap_the_line() {
         let mut s = ListSkips::default();
-        s.add(SkipKind::Dispatch, SkipWhy::Budget, 1, 0xa, vec![Root::Descriptor(0x100)]);
-        s.add(SkipKind::Dispatch, SkipWhy::Budget, 1, 0xa, vec![Root::Descriptor(0x100), Root::Table(8)]);
-        s.add(SkipKind::Draw, SkipWhy::Untranslated, 2, 0, vec![]);
-        for pso in 3..3 + PIPELINES_PER_LINE as usize {
-            s.add(SkipKind::Draw, SkipWhy::Budget, pso, 0, vec![]);
+        s.add(SkipKind::Dispatch, SkipWhy::Budget, 1, 0xa, vec![0xb], vec![Root::Descriptor(0x100)]);
+        s.add(SkipKind::Dispatch, SkipWhy::Budget, 1, 0xa, vec![0xb], vec![Root::Descriptor(0x100), Root::Table(8, vec![])]);
+        s.add(SkipKind::Draw, SkipWhy::Untranslated, 2, 0, vec![], vec![]);
+        for pso in 3..3 + PIPELINES_PER_LINE {
+            s.add(SkipKind::Draw, SkipWhy::Budget, pso, 0, vec![], vec![]);
         }
         assert_eq!((s.draws, s.dispatches), (1 + PIPELINES_PER_LINE as u64, 2));
         assert_eq!(s.pipelines.len(), PIPELINES_PER_LINE);
         assert_eq!(s.pipelines[0].count, 2);
-        assert_eq!(s.pipelines[0].roots, vec![Root::Descriptor(0x100), Root::Table(8)]);
+        assert_eq!(s.pipelines[0].roots, vec![Root::Descriptor(0x100), Root::Table(8, vec![])]);
         assert_eq!(s.more, 2);
         let line = s.describe();
-        assert!(line.starts_with("pso 0x1 key 000000000000000a x2 [budget] roots [d:0x100 t:0x8]"), "{line}");
+        assert!(line.starts_with("pso 0x1 key 000000000000000a records [000000000000000b] x2 [budget] roots [d:0x100 t:0x8{}]"), "{line}");
         assert!(line.ends_with("+2 skips of other pipelines"), "{line}");
         let mut merged = ListSkips::default();
         merged.merge(s);

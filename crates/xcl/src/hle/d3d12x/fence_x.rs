@@ -121,11 +121,13 @@ pub(super) struct FenceSnapshot {
     pub cell: bool,
 }
 
-/// Every title fence a queue signalled or waited for, with its completed value now.
-pub(super) fn snapshot() -> Vec<FenceSnapshot> {
+/// Every title fence a queue signalled or waited for that `alive` holds a reference to, with its
+/// completed value now.
+pub(super) fn snapshot(alive: impl Fn(usize) -> bool) -> Vec<FenceSnapshot> {
     let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
     g.iter()
         .flatten()
+        .filter(|(&p, _)| alive(p))
         .map(|(&p, f)| FenceSnapshot {
             fence: p,
             done: unsafe { borrowed(p, |f| f.GetCompletedValue()) }.unwrap_or(0),

@@ -3073,6 +3073,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
+    if super::wait_trace::on() {
+        super::wait_trace::submitted(q_raw, &one, &one);
+    }
     exec(q_raw, 1, one.as_ptr());
     copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
