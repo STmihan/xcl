@@ -623,6 +623,41 @@ pub fn page_bytes() -> (usize, usize) {
     })
 }
 
+pub struct PageBreakdown {
+    pub own_used: usize,
+    pub own_idle: usize,
+    pub extra_used: usize,
+    pub extra_idle: usize,
+    pub free: usize,
+    pub cooling: usize,
+    pub targets: usize,
+}
+
+pub fn page_breakdown() -> PageBreakdown {
+    let g = PAGES.lock().unwrap();
+    let mut b = PageBreakdown { own_used: 0, own_idle: 0, extra_used: 0, extra_idle: 0, free: 0, cooling: 0, targets: 0 };
+    for p in g.values().flatten() {
+        for page in p.pages.values() {
+            if page.users > 0 {
+                b.own_used += PAGE;
+            } else {
+                b.own_idle += PAGE;
+            }
+        }
+        for page in p.extra_pages.values() {
+            if page.users > 0 {
+                b.extra_used += PAGE;
+            } else {
+                b.extra_idle += PAGE;
+            }
+        }
+        b.free += p.free.len() * PAGE;
+        b.cooling += p.cooling.len() * PAGE;
+        b.targets += p.targets.len();
+    }
+    b
+}
+
 /// Heaps of every kind of resource in one (resource heap tier 2) – else no arenas.
 fn tier2(dev: &ID3D12Device) -> bool {
     let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();

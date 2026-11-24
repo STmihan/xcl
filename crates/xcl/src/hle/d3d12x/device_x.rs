@@ -851,6 +851,33 @@ fn note_alias(va: usize, x: &[u8; 0x38]) {
     }
 }
 
+const PLACEMENT_REPORT_EVERY: u64 = 5000;
+const PLACEMENT_REPORT_TOP: usize = 12;
+
+type PlacementShape = (u32, u64, u32, u16, u16, u32, u32);
+
+fn note_gpu_owned_placement(pc: &D3D12_RESOURCE_DESC, flags: u32, console_bytes: Option<u64>) {
+    static SHAPES: std::sync::Mutex<Option<std::collections::HashMap<PlacementShape, (u64, u64)>>> = std::sync::Mutex::new(None);
+    static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = (pc.Dimension.0 as u32, pc.Width, pc.Height, pc.DepthOrArraySize, pc.MipLevels, pc.Format.0 as u32, flags & 0x7);
+    let bytes = console_bytes.unwrap_or(0);
+    let mut g = SHAPES.lock().unwrap();
+    let e = g.get_or_insert_with(Default::default).entry(key).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += bytes;
+    let n = TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n % PLACEMENT_REPORT_EVERY != 0 {
+        return;
+    }
+    let mut v: Vec<_> = g.as_ref().map(|m| m.iter().map(|(k, c)| (*k, *c)).collect()).unwrap_or_default();
+    v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    let total_bytes: u64 = v.iter().map(|x| x.1 .1).sum();
+    crate::xlog_info!("GPU-owned placements: {n} so far, {} MB of console size over {} shapes; largest:", total_bytes >> 20, v.len());
+    for ((dim, w, h, depth, mips, fmt, f), (count, b)) in v.into_iter().take(PLACEMENT_REPORT_TOP) {
+        crate::xlog_info!("  dim {dim} {w}x{h}x{depth} mips {mips} format {fmt} flags {f:#x}: {count} placements, {} MB", b >> 20);
+    }
+}
+
 /// device #44 CreatePlacedResourceX(address, desc, initial state, clear value, riid, resource):
 /// a resource in title memory. A buffer at a 64 KiB-aligned address in unified memory is that
 /// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
@@ -886,6 +913,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
         if super::vram::gpu_owned(flags) {
+            note_gpu_owned_placement(&pc, flags, console_bytes);
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
                     if let Some(bytes) = console_bytes {

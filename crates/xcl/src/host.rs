@@ -73,6 +73,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                let b = crate::hle::d3d12x::vram::page_breakdown();
+                crate::xlog_info!(
+                    "target pages: own {} MB in use + {} MB idle, past console size {} MB in use + {} MB idle; free {} MB, cooling {} MB; {} targets",
+                    mb(b.own_used as u64),
+                    mb(b.own_idle as u64),
+                    mb(b.extra_used as u64),
+                    mb(b.extra_idle as u64),
+                    mb(b.free as u64),
+                    mb(b.cooling as u64),
+                    b.targets
+                );
                 last = now;
             }
         });
