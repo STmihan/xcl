@@ -606,6 +606,17 @@ impl Input {
     }
 }
 
+const SKIP_PIPELINE_DXIL_VAR: &str = "XCL_SKIP_PIPELINE_DXIL";
+
+fn skipped_pipeline_dxil() -> &'static std::collections::HashSet<u64> {
+    static SET: std::sync::OnceLock<std::collections::HashSet<u64>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        std::env::var(SKIP_PIPELINE_DXIL_VAR)
+            .map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect())
+            .unwrap_or_default()
+    })
+}
+
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
@@ -765,9 +776,13 @@ impl Pipelines {
         }
     }
 
-    /// The compute pipeline of `c` (made and released).
     fn make(&self, c: &recomp::pso::Compiled) {
         use windows::Win32::Graphics::Direct3D12::*;
+        let dxil_hash = crate::gpu::shader::fnv64(&c.dxil);
+        if skipped_pipeline_dxil().contains(&dxil_hash) {
+            eprintln!("  pipeline of DXIL {dxil_hash:016x} ({} B) skipped ({SKIP_PIPELINE_DXIL_VAR})", c.dxil.len());
+            return;
+        }
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
             let mut g = self.signatures.lock().unwrap();
