@@ -297,7 +297,7 @@ struct RecompAgg {
     /// (name, HLSL, profile) of complete translations kept for the DXC check
     samples: Vec<(String, String, &'static str)>,
     /// programs translated in a graphics mode (VS / PS interface from the container)
-    by_mode: BTreeMap<String, (usize, usize)>,
+    by_mode: BTreeMap<String, (usize, usize, usize)>,
     hlsl_bytes: usize,
     /// VS / PS (the driver picks the wave size): wave32 programs (run split in 64-lane waves)
     /// and wave64 programs whose cross-lane reads break in 32-lane waves (kind → programs)
@@ -342,10 +342,11 @@ impl RecompAgg {
         for (k, v) in o.wave_resolved {
             *self.wave_resolved.entry(k).or_default() += v;
         }
-        for (k, (a, b)) in o.by_mode {
+        for (k, (a, b, bytes)) in o.by_mode {
             let e = self.by_mode.entry(k).or_default();
             e.0 += a;
             e.1 += b;
+            e.2 += bytes;
         }
         self.hlsl_bytes += o.hlsl_bytes;
     }
@@ -395,6 +396,7 @@ impl RecompAgg {
                 let e = self.by_mode.entry(label.to_string()).or_default();
                 e.0 += 1;
                 e.1 += t.complete() as usize;
+                e.2 += t.hlsl.len();
                 self.hlsl_bytes += t.hlsl.len();
                 for (m, n) in &t.unsupported {
                     let e = self.missing.entry(m.clone()).or_default();
@@ -1002,6 +1004,7 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let times: Mutex<Vec<(f64, usize, String)>> = Mutex::new(Vec::new());
+    let dxil_sizes: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
     let parts: Vec<(usize, Vec<String>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..threads)
@@ -1013,7 +1016,10 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
                         let Some((name, hlsl, profile)) = samples.get(i) else { break };
                         let t0 = std::time::Instant::now();
                         match recomp::dxc::compile(hlsl, "main", profile, &[]) {
-                            Ok(_) => ok += 1,
+                            Ok(dxil) => {
+                                ok += 1;
+                                dxil_sizes.lock().unwrap().push(dxil.len());
+                            }
                             Err(e) => bad.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.as_str()))),
                         }
                         times.lock().unwrap().push((t0.elapsed().as_secs_f64(), hlsl.len(), name.clone()));
@@ -1029,6 +1035,10 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let ok = parts.iter().map(|p| p.0).sum();
+    let dxil_sizes = dxil_sizes.into_inner().unwrap();
+    if let Some(largest) = dxil_sizes.iter().max() {
+        eprintln!("DXIL of the sample: {} bytes in {} programs, largest {largest} bytes", dxil_sizes.iter().sum::<usize>(), dxil_sizes.len());
+    }
     let mut t = times.into_inner().unwrap();
     t.sort_by(|a, b| a.0.total_cmp(&b.0));
     if !t.is_empty() {
@@ -1243,8 +1253,8 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
         for e in &rc.error_examples {
             println!("  error: {e}");
         }
-        for (m, (n, c)) in &rc.by_mode {
-            println!("  mode {m}: {n} programs, complete {c} ({:.1}%)", *c as f64 * 100.0 / (*n).max(1) as f64);
+        for (m, (n, c, bytes)) in &rc.by_mode {
+            println!("  mode {m}: {n} programs, complete {c} ({:.1}%), HLSL: {bytes} bytes", *c as f64 * 100.0 / (*n).max(1) as f64);
         }
         println!("missing instructions (number of programs; programs it blocks as the only missing one; occurrences):");
         for (m, (n, p)) in missing.iter().take(top) {
