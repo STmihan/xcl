@@ -142,6 +142,8 @@ pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
 }
 
+/// Stack of every thread that builds a pipeline: DXC and the driver compiler recurse deeply on
+/// the biggest translated programs and overflow a title thread's stack.
 const BUILD_STACK_BYTES: usize = 64 << 20;
 
 /// Builds the real pipeline: its raw pointer, 0 = failed.
@@ -537,6 +539,9 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
 }
 
+/// Builds the pipeline a bind waits for on a scoped thread with a `BUILD_STACK_BYTES` stack at
+/// the bind's priority, and waits for it: the bind's own (title) thread may have a small stack.
+/// When no such thread can be made it builds on the bind's thread, as before.
 fn build_for_waiting_thread(p: &Arc<Pending>) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, SetThreadPriority};
     const THREAD_PRIORITY_ERROR_RETURN: i32 = i32::MAX;
