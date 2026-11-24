@@ -7539,6 +7539,8 @@ fn jumps_to_outer_loop_heads_are_structured() {
         entries: Vec<usize>,
     }
     let (mut structured, mut ran, mut entered) = (0, 0, 0);
+    let (mut entry_guards, mut range_guards, mut ends_among_others) = (0, 0, 0);
+    let gpu_wave = gpu_waves().first().copied();
     for round in 0..120 {
         let mut code: Vec<u8> = Vec::new();
         let mut open: Vec<Open> = Vec::new();
@@ -7633,13 +7635,15 @@ fn jumps_to_outer_loop_heads_are_structured() {
         }
         work(&mut code, 5);
         code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
-        let t = |s: bool| translate(&code, &Options { structured: s, ..Options::default() }).unwrap();
-        let (a, b) = (t(true), t(false));
+        let t = |s: bool, wave64: bool| translate(&code, &Options { structured: s, wave64, ..Options::default() }).unwrap();
+        let (a, b) = (t(true, true), t(false, true));
         assert!(a.complete() && b.complete(), "{:?}", a.unsupported_why);
         structured += !a.hlsl.contains("if (pc ==") as usize;
-        if !gpu_waves().contains(&true) {
-            continue;
-        }
+        entry_guards += a.hlsl.matches("if (!xcl_skip || xcl_skip ==").count();
+        range_guards += a.hlsl.matches("if (!xcl_skip || (xcl_skip >=").count();
+        ends_among_others += a.hlsl.lines().filter(|l| l.trim_start().starts_with("if (xcl_skip ==") && l.ends_with(") xcl_skip = 0u;")).count();
+        let Some(wave64) = gpu_wave else { continue };
+        let (a, b) = if wave64 { (a, b) } else { (t(true, false), t(false, false)) };
         ran += 1;
         let mut st = KernelState::default();
         for k in 0..4 {
@@ -7653,7 +7657,73 @@ fn jumps_to_outer_loop_heads_are_structured() {
         assert_eq!(u.vgpr, w.vgpr, "round {round}");
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
+    println!("guards into a loop: {entry_guards} for one target, {range_guards} for a range; {ends_among_others} skips ended where others may be under way");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+/// Two jumps from before a loop into its middle and one past it: the loop runs while either of
+/// the first two is under way (one guard over the range of their targets), its first iteration
+/// starts at the one taken; the third skips it.
+#[test]
+fn a_loop_entered_at_two_targets_runs_under_one_range_guard() {
+    const ITERATIONS: u32 = 3;
+    const PAST_THE_LOOP: u32 = 3;
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let (head, first_entry, second_entry, after) = (24, 28, 32, 48);
+    let mut code = Vec::new();
+    for (value, target) in [(1, first_entry), (2, second_entry), (PAST_THE_LOOP as u64, after)] {
+        code.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + value)]));
+        let words = (target - code.len() as i64) / 4 - 1;
+        code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", words as u64 & 0xFFFF)]));
+    }
+    for reg in 1..=3 {
+        code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", reg), ("SSRC0", reg), ("SSRC1", 129)]));
+    }
+    code.extend(i("S_SUB_U32", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 129)]));
+    code.extend(i("S_CMP_GT_I32", "ENC_SOPC", &[("SSRC0", 20), ("SSRC1", 128)]));
+    let words = (head - code.len() as i64) / 4 - 1;
+    code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", words as u64 & 0xFFFF)]));
+    assert_eq!(code.len() as i64, after);
+    code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete() && !t.hlsl.contains("if (pc ==") && t.hlsl.contains("if (!xcl_skip || (xcl_skip >= "), "{}", t.hlsl);
+    for wave64 in gpu_waves() {
+        for (entry, skipped) in [(0, [0, 0, 0]), (1, [1, 0, 0]), (2, [1, 1, 0]), (PAST_THE_LOOP, [ITERATIONS; 3])] {
+            let mut st = KernelState::default();
+            st.sgpr[0] = entry;
+            st.sgpr[20] = ITERATIONS;
+            let (r, _) = run_wave(&code, &st, wave64);
+            assert_eq!(&r.sgpr[1..4], &skipped.map(|s| ITERATIONS - s), "entered at {entry}, wave64 {wave64}");
+        }
+    }
+}
+
+/// A chain of partly overlapping loops nests one inside the other in the structured form; deeper
+/// than `MAX_STRUCTURED_LOOP_NESTING` the program is emitted as the block chain, which merges
+/// them into one loop (docs/code/recompiler-hlsl-size.md).
+#[test]
+fn a_chain_of_overlapping_loops_too_deep_for_structured_code_is_the_block_chain() {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    // `loops` heads (s1 += 1), then their back edges in the same order (s20 -= 1, back while > 0)
+    let chain = |loops: usize| {
+        let mut code = Vec::new();
+        let mut heads = Vec::new();
+        for _ in 0..loops {
+            heads.push(code.len() as i64);
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)]));
+        }
+        for head in heads {
+            code.extend(i("S_SUB_U32", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_GT_I32", "ENC_SOPC", &[("SSRC0", 20), ("SSRC1", 128)]));
+            let words = (head - code.len() as i64) / 4 - 1;
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", words as u64 & 0xFFFF)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        translate(&code, &Options::default()).unwrap()
+    };
+    let (shallow, deep) = (chain(super::MAX_STRUCTURED_LOOP_NESTING), chain(super::MAX_STRUCTURED_LOOP_NESTING + 1));
+    assert!(shallow.complete() && !shallow.hlsl.contains("if (pc =="), "{}", shallow.hlsl);
+    assert!(deep.complete() && deep.hlsl.contains("if (pc =="), "{}", deep.hlsl);
 }
 
 // ---- dead SCC writes (`scc_liveness`)
@@ -8018,15 +8088,16 @@ fn gpu_scalar_results_written_in_place_keep_aliased_operands_and_scc() {
     assert_eq!((r.sgpr[36], r.sgpr[37]), (0x000F_FFF0, 0), "s_andn1_wrexec_b64 returns the new exec");
 }
 
-/// Crossing forward jumps: each adds a skip flag to the guards of everything up to its target, so
-/// the guards grow with the square of their number. Where they outweigh the program
-/// (`GUARDS_OUTWEIGH_THE_CODE`) it is emitted as the block chain, with the same result.
+/// Crossing forward jumps: one skip is under way at a time, so every guard is one test of
+/// `xcl_skip` whatever the number of jumps, and the text grows with the number of jumps, not
+/// with its square (docs/code/recompiler-hlsl-size.md).
 #[test]
-fn a_program_with_more_guard_than_code_is_emitted_as_the_block_chain() {
+fn crossing_forward_jumps_stay_structured_with_guards_of_one_test() {
     const INSTRUCTION_BYTES: usize = 4;
     const SOURCE_BYTES: usize = 3 * INSTRUCTION_BYTES;
     const BRANCH_AT: usize = 2 * INSTRUCTION_BYTES;
-    const TAKEN_AT: u32 = 5;
+    const BITS: usize = 32;
+    const JUMPS: usize = 40;
     let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
     let step = |k: usize| 1 + (k % 7) as u32;
     // `jumps` sources (s1 += 1; jump to target k if bit k of s0), then the targets (s2 += step)
@@ -8034,7 +8105,7 @@ fn a_program_with_more_guard_than_code_is_emitted_as_the_block_chain() {
         let mut code = Vec::new();
         for k in 0..jumps {
             code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)]));
-            code.extend(i("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + (k % 32) as u64)]));
+            code.extend(i("S_BITCMP1_B32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128 + (k % BITS) as u64)]));
             let (at, target) = (k * SOURCE_BYTES + BRANCH_AT, jumps * SOURCE_BYTES + k * INSTRUCTION_BYTES);
             let words = (target - at) / INSTRUCTION_BYTES - 1;
             code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", words as u64)]));
@@ -8045,23 +8116,26 @@ fn a_program_with_more_guard_than_code_is_emitted_as_the_block_chain() {
         code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
         code
     };
-    let is_block_chain = |hlsl: &str| hlsl.contains("if (pc ==");
-    let block_chain = |code: &[u8]| translate(code, &Options { structured: false, ..Options::default() }).unwrap().hlsl;
-    let few = translate(&crossing(3), &Options::default()).unwrap();
-    assert!(few.complete() && !is_block_chain(&few.hlsl), "{}", few.hlsl);
-    let jumps = 40;
-    let code = crossing(jumps);
-    let many = translate(&code, &Options::default()).unwrap();
-    assert!(many.complete() && is_block_chain(&many.hlsl), "{}", many.hlsl);
-    assert!(many.hlsl == block_chain(&code), "{}", many.hlsl);
+    let structured = |jumps: usize| {
+        let t = translate(&crossing(jumps), &Options::default()).unwrap();
+        assert!(t.complete() && !t.hlsl.contains("if (pc =="), "{}", t.hlsl);
+        assert!(!t.hlsl.lines().any(|l| l.contains("xcl_skip") && l.contains("||")), "{}", t.hlsl);
+        t.hlsl.len()
+    };
+    let (quarter, half, whole) = (structured(JUMPS / 4), structured(JUMPS / 2), structured(JUMPS));
+    assert!((whole - half) <= 2 * (half - quarter) + (half - quarter) / 4, "{quarter} {half} {whole} bytes: not linear");
     if !gpu_ready() {
         return;
     }
-    let mut st = KernelState::default();
-    st.sgpr[0] = 1 << TAKEN_AT;
-    let r = runner::run_code(&code, &st, &[]).unwrap();
-    let targets_run: u32 = (TAKEN_AT as usize..jumps).map(step).sum();
-    assert_eq!((r.sgpr[1], r.sgpr[2]), (TAKEN_AT + 1, targets_run));
+    let code = crossing(JUMPS);
+    for first_taken in [Some(0), Some(5), Some(BITS - 1), None] {
+        let mut st = KernelState::default();
+        st.sgpr[0] = first_taken.map_or(0, |k| 1 << k);
+        let r = runner::run_code(&code, &st, &[]).unwrap();
+        let sources_run = first_taken.map_or(JUMPS, |k| k + 1) as u32;
+        let targets_run: u32 = (first_taken.unwrap_or(0)..JUMPS).map(step).sum();
+        assert_eq!((r.sgpr[1], r.sgpr[2]), (sources_run, targets_run), "first jump taken: {first_taken:?}");
+    }
 }
 
 fn misc_vs() -> (Vec<u8>, super::VsInterface) {

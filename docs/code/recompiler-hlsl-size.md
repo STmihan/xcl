@@ -62,24 +62,82 @@ destination:
 
 The check is by identifier (`mentions_identifier`), never by substring: `s1` is not found in `s10`.
 
-## Skip guards that outweigh the program
+## Skip guards: one variable, one test
 
-Structured control flow puts every item after a forward jump out of its level under
-`if (!(skip_a || skip_b || ...))`, one flag per pending target (`emit_structured` in `mod.rs`). With
-thousands of crossing jumps the guards grow with the square of their number. One compute program of a
-retail pack (76 696 instructions, 3 861 skip flags) came to 111 318 363 bytes of HLSL, 92 % of it
-guard lines (152 MB in the form with comments and four-space indentation); as the guarded block chain
-the same program is 4 819 218 bytes. DXC 1.9 does not get through the structured form at any
-level: its memory went past 40 GB within 55 s at `-O1` and past 32 GB within 28 s at `-O0` (both runs
-were ended there; the 152 MB form went past 12 GB within 21 s at `-O0`).
+A forward jump out of its level (a loop break, a jump past a join or into a loop, an `s_endpgm`
+before the end) is a skip: the code up to its target does not run. Structured control flow used
+one flag per target and put every item after such a jump under `if (!(skip_a || skip_b || ...))`,
+every pending flag of the level, reopened at each new flag and each target. With thousands of
+crossing jumps the guards grew with the square of their number. One compute program of a retail
+pack (`cb694c31e0525691`, 76 696 instructions, 3 861 skip targets) came to 111 318 363 bytes of
+HLSL, 92 % of it guard lines (152 MB in the form with comments and four-space indentation); as the
+guarded block chain it is 4 819 218 bytes. DXC 1.9 did not get through that form at any level: its
+memory went past 40 GB within 55 s at `-O1` and past 32 GB within 28 s at `-O0`.
 
-The block chain has structured stretches of its own (`structured_span`), with the same guards; in
-that pack none of them is large.
+Only one skip is ever under way. Code that starts one runs only while none is: it sits under the
+guards of every skip pending at its level, the levels around it are left through `break` or are
+under their own guards, and a loop clears or continues a skip to its latch or head before its
+next iteration. So `emit_structured` keeps one `uint xcl_skip` (`SKIP` in `mod.rs`) holding the
+target of the skip under way, `0` for none (`NO_SKIP`), `0xFFFFFFFF` for the end of the program
+and `1` for address 0, a `continue` of a loop starting there (instructions are 4-byte aligned).
 
-`translate` therefore emits a program as the block chain when the guard lines of its structured form
-are more than half of its code (`GUARDS_OUTWEIGH_THE_CODE`). Over the 26 698 programs of that pack the
-largest shares are 92 % (that program) and then 5.6 %; no other program is more than 12 % larger
-structured than as the block chain. Test: `tests::a_program_with_more_guard_than_code_is_emitted_as_the_block_chain`.
+- a jump: `xcl_skip = <target>;`
+- the items after it: `if (!xcl_skip) { ... }`, reopened after every item that may start a skip
+- a loop entered in its middle by pending jumps: `if (!xcl_skip || xcl_skip == <target>)`, or with
+  several targets `(xcl_skip >= <first> && xcl_skip <= <last>)`. Every pending target inside the
+  loop enters it, so no other one lies in that range
+- a target: `xcl_skip = 0u;`, or `if (xcl_skip == <target>) xcl_skip = 0u;` where another skip may
+  still be pending at that point
+- the end of a loop body: the latch's skip is cleared, a skip to the head is `continue`, any other
+  one leaves the loop with a single `if (xcl_skip) break;`
+
+The guard text now grows with the number of items, not with items times pending targets. Over the
+26 698 programs of the pack (`xcl shaders --recomp`, one memory window, all translated before and
+after): 12 285 programs changed, 12 284 of them smaller (up to 53 420 bytes), total HLSL 2 219 150
+bytes smaller. `cb694c31e0525691` structured is now 9 487 293 bytes, 876 383 of them guard lines (it is emitted
+as the block chain: next section; guard lines 9 %); without its indentation it is 4 158 453 bytes against 4 107 893 for the block chain. Tests:
+`tests::crossing_forward_jumps_stay_structured_with_guards_of_one_test`,
+`tests::a_loop_entered_at_two_targets_runs_under_one_range_guard`, and
+`tests::jumps_to_outer_loop_heads_are_structured` (random loop nests, structured against the block
+chain on the GPU; on a GPU without 64-lane waves they run as wave32 programs).
+
+Two programs moved below the `-O1` limit by the change: `c8430b39bb4c9318` (361 549 to 358 723
+bytes) and `dbff19b454955b9f` (360 125 to 359 993). Both were in the "below 1 MiB before, now
+`-O1`" group of the calibration below, not among the programs the limit was set to keep. No
+limit separates the old `-O1` set from the rest any more (largest of the others now 359 736 bytes,
+smallest of the set 358 723), so it stays at 360 000: those two compile at `-O3`.
+
+The block chain has structured stretches of its own (`structured_span`), with the same variable;
+in that pack none of them is large.
+
+## Loops nested too deep for structured code
+
+What is left in `cb694c31e0525691` is nesting: its deepest point is 121 levels, 65 of them loops,
+the rest the guards between them. `nested_loop_ranges` turns a chain of partly overlapping loops
+into loops nested inside each other that end at the same place, where `loop_ranges` (the block
+chain) merges them into one. Over the pack the next deepest programs nest 13 loops. DXC 1.9
+(`-E main -T cs_6_6 -HV 2021`) on its two forms:
+
+| form | HLSL bytes | level | time | peak memory | DXIL bytes |
+| --- | --- | --- | --- | --- | --- |
+| structured | 9 487 293 | `-O1` (what `dxc.rs` picks) | ended at 20 min, unfinished | 1.25 GB | – |
+| structured | 9 487 293 | `-O0` | 294 s, 902 s on a busier machine | 1.66 GB | 11 508 444 |
+| block chain | 4 819 218 | `-O0` | 49 s | 1.66 GB | 11 356 484 |
+| block chain | 4 819 218 | `-O1` | unfinished after 60 min (above) | | |
+
+The structured runs shared the machine with a build or with other DXC processes (the second `-O0`
+run with four of them), so their times are upper bounds; that the nesting is what slows DXC down is
+a hypothesis, not measured. Neither form compiles at `-O1` in reasonable time; the block chain is
+the one known to compile (at `-O0`). `translate` therefore emits a program whose loops nest more
+than `MAX_STRUCTURED_LOOP_NESTING` (32) deep in the structured form as the block chain: in that pack
+only this program (as the block chain now 4 818 552 bytes, its structured stretches use the one
+variable). This replaces the earlier test of the guards' share of the code, which no program comes
+near any more (largest 9 %, then 1.5 %). With it, over the pack: 12 285 programs smaller, none
+larger, total HLSL 6 887 891 bytes smaller. Test:
+`tests::a_chain_of_overlapping_loops_too_deep_for_structured_code_is_the_block_chain`.
+
+Merging such chains in the structured form too (one loop, as the block chain does) would remove the
+nesting; it was not tried.
 
 ## DXC optimisation level
 
@@ -117,10 +175,10 @@ four-space indentation, every SCC write and every select:
 | `3a47dae75a517a13` | 29 598 855 | 9 302 789 | 9 236 536 | 8 994 604 | 232 s | 193 s | 2.8 GB |
 | `a983c0d77d33ea04` | 29 524 131 | 9 267 775 | 9 195 688 | 8 958 352 | 166 s | 155 s | 2.8 GB |
 | `a3b015f9c6a34f41` | 12 473 761 | 3 992 519 | 1 975 824 | 1 965 296 | 824 s | 677 s | 0.9 GB |
-| `cb694c31e0525691` | 152 022 357 | 4 819 218 (block chain) | none (see above) | none after 60 min | – | > 3 600 s | 2.6 GB |
+| `cb694c31e0525691` | 152 022 357 | 4 818 552 (block chain) | none (see above) | none after 60 min | – | > 3 600 s | 2.6 GB |
 
 The runs were not alone on the machine (a second DXC process beside most of them): differences in
-time of a fifth say nothing. The last program is the one of "Skip guards that outweigh the program":
+time of a fifth say nothing. The last program is the one of "Loops nested too deep for structured code":
 as the block chain DXC gets through it at `-O0` (48.7 s, 1.6 GB, 11 356 484 bytes of DXIL) and had
 not finished at `-O1` after an hour. It is the one program of the pack for which the `-O1` rule is
 not yet shown to work.
@@ -149,7 +207,7 @@ The split wave64 form NVIDIA GPUs get (`Options::split_wave64`) was not calibrat
 Memory windows from the descriptor heap (`Options::heap_windows`, `XCL_HEAP_WINDOWS=1`) change only the
 accessor functions that `emit::windowed` writes once per program after its text: with one memory
 window nothing, with several only those accessors (no `switch` over the windows). The limits and
-`GUARDS_OUTWEIGH_THE_CODE` (measured on the body, before the accessors) were left as they are: all
+the fallback to the block chain (then a share of the body, before the accessors) were left as they are: all
 26 698 programs of the pack gave byte-identical HLSL from `xcl shaders --recomp` before and after
 that change came in. The heap form itself was not calibrated either, for the same reason as the
 split form.

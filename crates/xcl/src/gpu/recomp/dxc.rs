@@ -486,8 +486,8 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 /// indentation, temporaries, SCC writes and selects have gone since: every program only moved
 /// further below it) – in every form (split wave64, four memory windows, `XCL_RECOMP_COMMENTS`)
 /// the giants stay at -O1. Nothing in that pack is above the limit now (its one 111 MB program,
-/// nine tenths of it skip guards, was beyond DXC at -O0 and -O1 alike and is emitted as the block
-/// chain instead: `GUARDS_OUTWEIGH_THE_CODE`). docs/code/recompiler-hlsl-size.md.
+/// nine tenths of it skip guards, is 9.5 MB since all skips share one variable, and is emitted
+/// as the block chain: `MAX_STRUCTURED_LOOP_NESTING`). docs/code/recompiler-hlsl-size.md.
 const UNOPTIMISED_ABOVE_HLSL_BYTES: usize = 64 * 1024 * 1024;
 /// HLSL larger than this compiles at -O1 (was 1 MiB while the HLSL carried a comment per
 /// instruction, four-space indentation, every SCC write and every EXEC select; rescaled so that
