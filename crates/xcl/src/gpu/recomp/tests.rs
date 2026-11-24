@@ -7658,6 +7658,34 @@ fn a_loop_entered_at_two_targets_runs_under_one_range_guard() {
     }
 }
 
+/// A chain of partly overlapping loops nests one inside the other in the structured form; deeper
+/// than `MAX_STRUCTURED_LOOP_NESTING` the program is emitted as the block chain, which merges
+/// them into one loop (docs/code/recompiler-hlsl-size.md).
+#[test]
+fn a_chain_of_overlapping_loops_too_deep_for_structured_code_is_the_block_chain() {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    // `loops` heads (s1 += 1), then their back edges in the same order (s20 -= 1, back while > 0)
+    let chain = |loops: usize| {
+        let mut code = Vec::new();
+        let mut heads = Vec::new();
+        for _ in 0..loops {
+            heads.push(code.len() as i64);
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)]));
+        }
+        for head in heads {
+            code.extend(i("S_SUB_U32", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 129)]));
+            code.extend(i("S_CMP_GT_I32", "ENC_SOPC", &[("SSRC0", 20), ("SSRC1", 128)]));
+            let words = (head - code.len() as i64) / 4 - 1;
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", words as u64 & 0xFFFF)]));
+        }
+        code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+        translate(&code, &Options::default()).unwrap()
+    };
+    let (shallow, deep) = (chain(super::MAX_STRUCTURED_LOOP_NESTING), chain(super::MAX_STRUCTURED_LOOP_NESTING + 1));
+    assert!(shallow.complete() && !shallow.hlsl.contains("if (pc =="), "{}", shallow.hlsl);
+    assert!(deep.complete() && deep.hlsl.contains("if (pc =="), "{}", deep.hlsl);
+}
+
 // ---- dead SCC writes (`scc_liveness`)
 
 fn compute_mode() -> Options {
