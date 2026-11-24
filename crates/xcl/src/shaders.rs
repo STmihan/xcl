@@ -824,7 +824,10 @@ impl Pipelines {
             Ok(pso)
         } else {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            eprintln!("  pipeline build starts: DXIL {dxil_hash:016x} ({} B)", c.dxil.len());
+            let started = std::time::Instant::now();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+            eprintln!("  pipeline build ends: DXIL {dxil_hash:016x} after {} ms", started.elapsed().as_millis());
             if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
                 if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
