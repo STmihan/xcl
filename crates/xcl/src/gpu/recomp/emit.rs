@@ -614,6 +614,12 @@ impl Em {
         std::mem::take(&mut self.out)
     }
 
+    /// Number the following temporaries from t1 again; returns how many were made since the
+    /// last reset (the compact form emits each instruction on its own and shares equal texts).
+    pub fn reset_temps(&mut self) -> usize {
+        std::mem::take(&mut self.tmp)
+    }
+
     fn line(&mut self, s: &str) {
         let (pc, lane_test) = (self.cur_pc, self.lane_test());
         if let Some(trace) = &mut self.lane_trace {
