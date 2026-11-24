@@ -523,13 +523,18 @@ impl Pages {
         self.pool.release_empty(&mut self.pools, POOL_PAGES, now);
     }
 
-    /// Page budget: at the budget, before `missing` new tiles would come from a new pool heap,
-    /// textures are evicted least recently used first, then tiles still cooling are reused (a draw
-    /// still in flight may read the newer texels there for a frame). True when something was
-    /// evicted: pages the caller counted as shared may be gone, so it counts its missing tiles again.
-    unsafe fn make_room(&mut self, missing: usize, now: std::time::Instant) -> bool {
+    /// Page budget: whether the live pool heaps reached `XCL_PAGE_BUDGET_MB`.
+    fn at_budget(&self) -> bool {
         let cap = pool_cap();
-        if cap == 0 || self.pools.iter().filter(|h| h.is_some()).count() < cap {
+        cap > 0 && self.pools.iter().filter(|h| h.is_some()).count() >= cap
+    }
+
+    /// Page budget: at the budget, before `missing` new tiles would come from a new pool heap,
+    /// textures are evicted least recently used first. True when something was evicted: pages
+    /// the caller counted as shared may be gone, so it counts its missing tiles again before
+    /// `reuse_cooling`.
+    unsafe fn make_room(&mut self, missing: usize, now: std::time::Instant) -> bool {
+        if !self.at_budget() {
             return false;
         }
         self.pool.drain_cooling(now);
@@ -546,8 +551,16 @@ impl Pages {
                 evicted = true;
             }
         }
-        self.pool.reclaim_cooling(missing.saturating_sub(self.pool.free_total));
         evicted
+    }
+
+    /// Page budget: at the budget, tiles still cooling cover what the free tiles do not of
+    /// `missing` (a draw still in flight may read the newer texels there for a frame).
+    fn reuse_cooling(&mut self, missing: usize, now: std::time::Instant) {
+        if self.at_budget() {
+            self.pool.drain_cooling(now);
+            self.pool.reclaim_cooling(missing.saturating_sub(self.pool.free_total));
+        }
     }
 
     /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
@@ -725,6 +738,7 @@ impl Pages {
         if self.make_room(missing, now) {
             (missing, preferred) = self.missing_tiles(va, first, own, total);
         }
+        self.reuse_cooling(missing, now);
 
         let pools = &mut self.pools;
         let pool = &mut self.pool;
@@ -1356,6 +1370,26 @@ mod tests {
         assert_eq!(pools, vec![Some(10), Some(40), None]);
         let all = pool.take_batch(2 * P as usize, None, t0 + COOL + Duration::from_secs(1), P, || None).unwrap();
         assert!(all.iter().all(|&(h, _)| h <= 1));
+        assert_eq!(pool.free_total, 0);
+    }
+
+    /// Page budget: tiles still cooling are handed out before they cooled once reclaimed, oldest
+    /// first, without a new pool heap.
+    #[test]
+    fn reclaimed_cooling_tiles_are_taken_before_they_cooled() {
+        const P: u32 = 8;
+        let t0 = Instant::now();
+        let mut pool = TilePool::new();
+        pool.add_heap_at(0, P);
+        let all = pool.take_batch(P as usize, None, t0, P, || None).unwrap();
+        for &t in &all {
+            pool.push_cooling(t, t0);
+        }
+        assert!(pool.take_batch(1, None, t0, P, || None).is_none(), "nothing cooled yet");
+        pool.reclaim_cooling(3);
+        assert_eq!(pool.cooling.len(), P as usize - 3);
+        let taken = pool.take_batch(3, None, t0, P, || None).unwrap();
+        assert_eq!(taken, all[..3]);
         assert_eq!(pool.free_total, 0);
     }
 
