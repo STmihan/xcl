@@ -1580,21 +1580,37 @@ fn note_compact(code: &[u8], what: impl FnOnce() -> String) {
 /// `compact::translate_compact`).
 struct Prepared {
     insts: Vec<Decoded>,
-    starts: BTreeSet<u64>,
     leaders: BTreeSet<u64>,
     branches: usize,
-    gs_jump: Option<Option<u64>>,
     em: emit::Em,
 }
 
-fn prepare(code: &[u8], opt: &Options) -> Result<Prepared, String> {
-    let normalized;
-    let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
-        normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
-        &normalized
+/// The decoded instructions, their addresses, the block leaders and the number of branches.
+struct Program {
+    insts: Vec<Decoded>,
+    starts: BTreeSet<u64>,
+    leaders: BTreeSet<u64>,
+    branches: usize,
+}
+
+/// `opt` with `HEAP_WINDOWS` in `mem_windows` turned into `heap_windows`.
+fn normalized_options(opt: &Options) -> std::borrow::Cow<'_, Options> {
+    if opt.mem_windows & HEAP_WINDOWS != 0 {
+        std::borrow::Cow::Owned(Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() })
     } else {
-        opt
-    };
+        std::borrow::Cow::Borrowed(opt)
+    }
+}
+
+/// geometry mode: the ES's s_setpc_b64 continues into the GS code (or ends the ES alone)
+fn gs_jump_of(opt: &Options) -> Option<Option<u64>> {
+    match &opt.mode {
+        Mode::Geometry(g) => Some(g.gs_start.filter(|&s| s > 0)),
+        _ => None,
+    }
+}
+
+fn decode_program(code: &[u8], opt: &Options) -> Result<Program, String> {
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1606,11 +1622,7 @@ fn prepare(code: &[u8], opt: &Options) -> Result<Prepared, String> {
     let starts: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
     let mut leaders: BTreeSet<u64> = BTreeSet::from([0]);
     let mut branches = 0usize;
-    // geometry mode: the ES's s_setpc_b64 continues into the GS code (or ends the ES alone)
-    let gs_jump = match &opt.mode {
-        Mode::Geometry(g) => Some(g.gs_start.filter(|&s| s > 0)),
-        _ => None,
-    };
+    let gs_jump = gs_jump_of(opt);
     for d in &insts {
         let next = d.pc + d.len as u64;
         if let (Some(target), "S_SETPC_B64", None) = (gs_jump, d.inst.name, d.far_target) {
@@ -1632,6 +1644,23 @@ fn prepare(code: &[u8], opt: &Options) -> Result<Prepared, String> {
             leaders.insert(next);
         }
     }
+    Ok(Program { insts, starts, leaders, branches })
+}
+
+/// The decoded program and an emitter set up for it. The emitter predicates every lane write
+/// (`Predication::Every`): the compact backend emits each instruction once, without the traced /
+/// planned passes of `translate`.
+fn prepare(code: &[u8], opt: &Options) -> Result<Prepared, String> {
+    let opt = normalized_options(opt);
+    let Program { insts, leaders, branches, .. } = decode_program(code, &opt)?;
+    let em = new_em(&insts, &opt, &leaders, branches, Predication::Every);
+    Ok(Prepared { insts, leaders, branches, em })
+}
+
+pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let opt = normalized_options(opt);
+    let opt = opt.as_ref();
+    let Program { insts, starts, leaders, branches } = decode_program(code, opt)?;
     let traced = emit_program(&insts, opt, &starts, &leaders, branches, Predication::Traced);
     let planned = match traced.em.lane_trace.as_ref().map(|trace| predication::plan(&insts, opt.wave64, trace)) {
         Some(plan) if !plan.is_empty() => emit_program(&insts, opt, &starts, &leaders, branches, Predication::Planned(plan)),
@@ -1644,6 +1673,8 @@ fn prepare(code: &[u8], opt: &Options) -> Result<Prepared, String> {
 }
 
 enum Predication {
+    /// every lane write predicated, nothing traced
+    Every,
     Traced,
     Planned(predication::Plan),
 }
@@ -1658,13 +1689,10 @@ fn drops_unobservable_predication(opt: &Options) -> bool {
     matches!(opt.mode, Mode::Compute(_)) && opt.lane_predication == LanePredication::WhereObservable && std::env::var_os(PREDICATE_EVERY_WRITE_ENV).is_none()
 }
 
-fn emit_program(insts: &[Decoded], opt: &Options, starts: &BTreeSet<u64>, leaders: &BTreeSet<u64>, branches: usize, predication: Predication) -> Emitted {
-    let gs_jump = match &opt.mode {
-        Mode::Geometry(g) => Some(g.gs_start.filter(|&s| s > 0)),
-        _ => None,
-    };
+fn new_em(insts: &[Decoded], opt: &Options, leaders: &BTreeSet<u64>, branches: usize, predication: Predication) -> emit::Em {
     let mut em = emit::Em::new(Options { source_comments: opt.source_comments || std::env::var_os(SOURCE_COMMENTS_ENV).is_some(), ..opt.clone() });
     match predication {
+        Predication::Every => {}
         Predication::Traced if drops_unobservable_predication(opt) => em.lane_trace = Some(Default::default()),
         Predication::Traced => {}
         Predication::Planned(plan) => em.predication = plan,
@@ -1702,11 +1730,12 @@ fn emit_program(insts: &[Decoded], opt: &Options, starts: &BTreeSet<u64>, leader
     if let Mode::Pixel(ps) = &opt.mode {
         em.ps_modes = emit::ps_attr_modes(insts, ps.input_ena);
     }
-    Ok(Prepared { insts, starts, leaders, branches, gs_jump, em })
+    em
 }
 
-pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
-    let Prepared { insts, starts, leaders, branches, gs_jump, mut em } = prepare(code, opt)?;
+fn emit_program(insts: &[Decoded], opt: &Options, starts: &BTreeSet<u64>, leaders: &BTreeSet<u64>, branches: usize, predication: Predication) -> Emitted {
+    let gs_jump = gs_jump_of(opt);
+    let mut em = new_em(insts, opt, leaders, branches, predication);
     let mut body = String::new();
     let mut blocks = 0usize;
     if branches == 0 {
