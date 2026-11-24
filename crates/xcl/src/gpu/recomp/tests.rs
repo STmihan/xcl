@@ -8411,3 +8411,50 @@ fn mesh_params_follow_the_console_output_table() {
     let own = stores(None);
     assert_eq!((slot_of(&own, 10), slot_of(&own, 11), slot_of(&own, 12)), (vec![0], vec![1], vec![2]));
 }
+
+/// The direct DXIL mesh pass (`XCL_DIRECT_DXIL=1`) stores `exp param N` at the same record
+/// slots as the HLSL mesh mode: the register from the console's output table
+/// (`ms_param_register`), XCL's own order only without one; and pos1's misc component into
+/// the misc dword when the signature declares a layer / viewport index.
+#[test]
+fn gpu_direct_mesh_params_follow_the_console_output_table() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{MsInterface, MESH_HEADER};
+    use crate::gpu::dxil::kernel::{translate_mesh, KernelOptions};
+    let sig = |name: &str, index: u32, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0,
+        stream: 0,
+    };
+    let outputs = vec![sig("SV_ClipDistance", 0, 2, 0), sig("TEXCOORD", 0, 0, 1), sig("TEXCOORD", 1, 0, 2), sig("TEXCOORD", 2, 0, 3), sig("SV_Position", 0, 1, 4)];
+    let exp = |tgt: u64, en: u64, src: u64| ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", src), ("VSRC1", src), ("VSRC2", src), ("VSRC3", src)], None);
+    let movk = |v: u64, k: u32| ("V_MOV_B32", "ENC_VOP1", vec![("VDST", v), ("SRC0", 255)], Some(k));
+    let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> =
+        vec![movk(10, 0xA0), movk(11, 0xB1), movk(12, 0xC2), movk(13, 3 << 16 | 5), exp(32, 0xF, 10), exp(33, 0xF, 11), exp(34, 0xF, 12), exp(13, 0x4, 13)];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let o = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let record = |ms: &MsInterface| -> Vec<u32> {
+        let k = translate_mesh(&code, o, ms).unwrap_or_else(|e| panic!("direct DXIL: {e}"));
+        let r = runner::run(&k.dxil, &KernelState::default(), &[]).unwrap();
+        r.raw[MESH_HEADER..MESH_HEADER + ms.vert_dwords()].to_vec()
+    };
+    let slots = |vtx: &[u32]| -> Vec<u32> { (1..=4).map(|s| vtx[4 * s]).collect() };
+    let ms = |params: Option<Vec<u32>>, outputs: Vec<crate::gpu::dxbc::SigElement>| MsInterface { outputs, threads: 32, max_vertices: 32, max_primitives: 32, params };
+    // the console's table: clip register 0 is param 0, TEXCOORD1 (register 2) is never written
+    assert_eq!(slots(&record(&ms(Some(vec![0, 1, 3]), outputs.clone()))), vec![0xB1, 0, 0xC2, 0xA0]);
+    // without the table: XCL's own order, the clip distances last
+    assert_eq!(slots(&record(&ms(None, outputs.clone()))), vec![0xA0, 0xB1, 0xC2, 0]);
+    // a layer / viewport index in the signature: pos1.z lands in the misc dword
+    let mut layered = outputs.clone();
+    layered.push(crate::gpu::dxbc::SigElement { mask: 1, component_type: 1, ..sig("SV_RenderTargetArrayIndex", 0, super::SV_RENDER_TARGET_ARRAY_INDEX, 5) });
+    let lm = ms(Some(vec![0, 1, 3]), layered);
+    assert_eq!(record(&lm)[lm.misc_dword()], 3 << 16 | 5);
+}

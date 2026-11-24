@@ -1863,11 +1863,24 @@ impl Lw {
                     }
                 }
             }
+            // pos1 component 2: render-target array / viewport index, into the misc dword the
+            // pass-through reads (only when the signature declares one, as the HLSL mesh mode)
+            crate::gpu::recomp::EXP_POS_MISC if crate::gpu::recomp::has_misc_vector(&self.mesh.as_ref().expect("mesh").ms.outputs) => {
+                let c = crate::gpu::recomp::EXP_MISC_COMPONENT;
+                if enabled(c) {
+                    let misc = self.mesh.as_ref().expect("mesh").ms.misc_dword() as u32;
+                    let at = self.addc(vtx, misc);
+                    let v = comp(self, c);
+                    st.push((at, v));
+                }
+            }
             13..=15 | 9 => {}
             32..=63 => {
+                // param N writes the register the console's output table names
+                // (`ms_param_register`), not the N-th of `param_registers`
                 let k = (tgt - 32) as usize;
-                let outputs = self.mesh.as_ref().expect("mesh").outputs.clone();
-                let at = crate::gpu::recomp::param_registers(&outputs, true).get(k).map(|&r| crate::gpu::recomp::elements_at(&outputs, true, r)).unwrap_or_default();
+                let ms = &self.mesh.as_ref().expect("mesh").ms;
+                let at = crate::gpu::recomp::ms_param_register(ms, k).map(|r| crate::gpu::recomp::elements_at(&ms.outputs, true, r)).unwrap_or_default();
                 for j in at {
                     for c in 0..4 {
                         if enabled(c) {

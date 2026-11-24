@@ -56,12 +56,13 @@ pub struct ComputeInit {
 }
 
 /// Mesh (NGG) first pass: where this group's record and this thread's vertex /
-/// primitive slots are in `res` (dwords), and the per-vertex outputs.
+/// primitive slots are in `res` (dwords), and the mesh interface (per-vertex outputs and the
+/// console's `exp param` table).
 pub struct MeshCtx {
     pub rec: Value,
     pub vtx: Value,
     pub prm: Value,
-    pub outputs: Vec<crate::gpu::dxbc::SigElement>,
+    pub ms: crate::gpu::recomp::MsInterface,
 }
 
 /// Initial register values: loaded from `io` in the entry block on first use.

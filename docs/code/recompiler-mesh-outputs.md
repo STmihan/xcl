@@ -79,5 +79,16 @@ the first 32 met (30 MS as `cs_6_6`, 2 VS as `vs_6_6`), all valid.
 - Earlier counts (261 / 211 / 780) were not reproduced, and how they were made is not recorded.
   This document's counts use the parser above.
 
-Tests: `mesh_params_follow_the_console_output_table` (`gpu/recomp/tests.rs`) and
+## The direct DXIL path
+
+The direct RDNA2 → DXIL translator (`XCL_DIRECT_DXIL=1`, `gpu/dxil/`, upstream #1426) lowers the
+mesh pass's exports itself, in `mesh_export` (`gpu/dxil/lower_mem.rs`). As merged, its `exp param N`
+took the N-th entry of `param_registers(outputs, true)`, the order this fix replaced, and it dropped
+pos1 (the render-target array / viewport index) even when the signature declares one. Its
+`MeshCtx` now carries the whole `MsInterface`: params go through `ms_param_register`, and pos1's
+misc component is stored in `misc_dword` as in the HLSL mesh mode. The direct VS path already used
+`vs_param_register`. `TRANSLATOR_VERSION` went from 4 to 5, so cached direct entries are redone.
+
+Tests: `gpu_direct_mesh_params_follow_the_console_output_table` (`gpu/recomp/tests.rs`, runs the
+direct mesh pass on the GPU and reads the record; with the old order it fails), `mesh_params_follow_the_console_output_table` (`gpu/recomp/tests.rs`) and
 `output_table_tails_of_the_gta_vi_pack` (`gpu/recomp/mod.rs`).
