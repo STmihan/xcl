@@ -142,6 +142,8 @@ pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
 }
 
+const BUILD_STACK_BYTES: usize = 64 << 20;
+
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
@@ -154,7 +156,7 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
         let n = crate::gpu::recomp::dxc::compile_threads();
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(BUILD_STACK_BYTES).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(p) = next else { return };
                 // (None: a bind took it and builds it itself)
@@ -322,7 +324,7 @@ fn preload() -> Option<&'static Preload> {
     STARTED.call_once(|| {
         let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
         for k in 0..n {
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(BUILD_STACK_BYTES).spawn(move || {
                 unsafe {
                     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
                     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
@@ -430,6 +432,34 @@ mod used_tests {
     }
 
     #[test]
+    fn a_bind_that_builds_its_pipeline_builds_it_on_a_big_stack() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadStackLimits, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        const BUILT: usize = 0x5555;
+        let standin = 0x7E57_B006usize;
+        let binding_thread = std::thread::current().id();
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            let (mut lo, mut hi) = (0usize, 0usize);
+            unsafe { GetCurrentThreadStackLimits(&mut lo, &mut hi) };
+            let priority = unsafe { GetThreadPriority(GetCurrentThread()) };
+            tx.send((hi - lo, std::thread::current().id(), build_is_wanted(), wanted_here()(), priority)).unwrap();
+            BUILT
+        }), 0);
+        assert!(is_pending(standin), "a lazy pipeline waits for its first bind");
+        let (old_priority, ok) = unsafe { (GetThreadPriority(GetCurrentThread()), SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)) };
+        assert_ne!(ok, 0);
+        let real = resolve_wait_for(standin, None);
+        unsafe { SetThreadPriority(GetCurrentThread(), old_priority) };
+        assert_eq!(real, BUILT);
+        let (stack, builder, build_wanted, compiles_wanted, priority) = rx.recv().unwrap();
+        assert!(stack >= BUILD_STACK_BYTES, "built on a {stack}-byte stack");
+        assert_ne!(builder, binding_thread, "not on the bind's own stack");
+        assert!(build_wanted && compiles_wanted, "the bind waits for this build");
+        assert_eq!(priority, THREAD_PRIORITY_BELOW_NORMAL, "at the bind's priority");
+        let _ = released(standin);
+    }
+
+    #[test]
     fn the_keys_of_a_file_are_read_and_other_lines_passed_over() {
         let keys = used::parse("00000000000000ff\n\nnot a key\n  1a2b \n0\n");
         assert_eq!(keys.len(), 2);
@@ -493,11 +523,10 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
-        complete(&p, job());
-    }
     p.want();
+    if p.job.lock().unwrap().is_some() {
+        build_for_waiting_thread(&p);
+    }
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
@@ -506,6 +535,30 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         0 => pso,
         r => r,
     }
+}
+
+fn build_for_waiting_thread(p: &Arc<Pending>) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, SetThreadPriority};
+    const THREAD_PRIORITY_ERROR_RETURN: i32 = i32::MAX;
+    let priority = unsafe { GetThreadPriority(GetCurrentThread()) };
+    let take_and_build = || {
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            build(p, job, false);
+        }
+    };
+    std::thread::scope(|s| {
+        let spawned = std::thread::Builder::new().name("xcl-pso-bind".into()).stack_size(BUILD_STACK_BYTES).spawn_scoped(s, || {
+            if priority != THREAD_PRIORITY_ERROR_RETURN {
+                unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+            }
+            take_and_build();
+        });
+        if let Err(e) = spawned {
+            crate::xlog_warn!("D3D12.X: no thread with a {} MiB stack for a pipeline a bind waits for ({e}): built on the bind's own thread", BUILD_STACK_BYTES >> 20);
+            take_and_build();
+        }
+    });
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
