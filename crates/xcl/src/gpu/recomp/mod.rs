@@ -156,6 +156,9 @@ pub const MESH_HEADER: usize = 4;
 impl MsInterface {
     /// dwords per vertex: pos0 + every param (4 each, raw bits)
     pub fn vert_dwords(&self) -> usize {
+        self.misc_dword() + usize::from(has_misc_vector(&self.outputs))
+    }
+    pub fn misc_dword(&self) -> usize {
         4 * (1 + ranked(&self.outputs, true).len())
     }
     /// dwords of one group's record: header, vertices, primitives (1 dword each)
@@ -290,6 +293,21 @@ pub fn geometry_program(es_blob: &[u8], gs_blob: &[u8]) -> Result<(Vec<u8>, GsIn
     let mut code = es;
     code.extend_from_slice(&gs);
     Ok((code, g))
+}
+
+pub const SV_RENDER_TARGET_ARRAY_INDEX: u32 = 4;
+pub const SV_VIEWPORT_ARRAY_INDEX: u32 = 5;
+pub const MISC_LAYER_MASK: u32 = 0xFFFF;
+pub const MISC_VIEWPORT_SHIFT: u32 = 16;
+pub const EXP_POS_MISC: u64 = 13;
+pub const EXP_MISC_COMPONENT: usize = 2;
+
+pub fn has_misc_vector(sig: &[SigElement]) -> bool {
+    sig.iter().any(|e| matches!(e.system_value, SV_RENDER_TARGET_ARRAY_INDEX | SV_VIEWPORT_ARRAY_INDEX))
+}
+
+pub fn layer_output(sig: &[SigElement], system_value: u32) -> Option<&SigElement> {
+    sig.iter().find(|e| e.system_value == system_value)
 }
 
 /// Non-system elements in register order – the order of `exp param N` / `v_interp attrN`.

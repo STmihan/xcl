@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::{elements_at, has_misc_vector, layer_output, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER, EXP_MISC_COMPONENT, EXP_POS_MISC, MISC_LAYER_MASK, MISC_VIEWPORT_SHIFT, SV_RENDER_TARGET_ARRAY_INDEX, SV_VIEWPORT_ARRAY_INDEX};
 use super::upper_lanes::Read;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
@@ -2114,6 +2114,16 @@ impl Em {
                     }
                 }
             }
+            (Mode::Vertex(vs), EXP_POS_MISC) if has_misc_vector(&vs.outputs) => {
+                if enabled(EXP_MISC_COMPONENT) {
+                    let misc = Self::exp_comp(srcs, compr, EXP_MISC_COMPONENT);
+                    for (sv, field, _) in LAYER_FIELDS {
+                        if layer_output(&vs.outputs, sv).is_some() {
+                            st.push(format!("xo.{field} = {};", misc_field_value(sv, &misc)));
+                        }
+                    }
+                }
+            }
             (Mode::Vertex(_), 13..=15) => {} // misc vector / clip distances: SV_ClipDistance comes from its param
             (Mode::Vertex(vs), 32..=63) => {
                 // param N is a register: channel c goes to component c of every element there
@@ -2172,6 +2182,11 @@ impl Em {
                     if enabled(c) {
                         st.push(format!("res.Store((xcl_vtx + {c}u) * 4u, {});", Self::exp_comp(srcs, compr, c)));
                     }
+                }
+            }
+            (Mode::Mesh(ms), EXP_POS_MISC) if has_misc_vector(&ms.outputs) => {
+                if enabled(EXP_MISC_COMPONENT) {
+                    st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {});", ms.misc_dword(), Self::exp_comp(srcs, compr, EXP_MISC_COMPONENT)));
                 }
             }
             (Mode::Mesh(_), 13..=15) => {} // misc vector / clip distances (from their params)
@@ -4769,6 +4784,7 @@ impl Em {
                             let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & 8191u]);", 4 * slot + c, 16 * r + 4 * c as u32);
                         }
                     }
+                    gs_misc_store(&mut h, &g.outputs, rec.misc_dword());
                     h.push_str("    }\n");
                     let _ = writeln!(h, "    for (uint j = 0u; j < xcl_ntri; j++) {{\n        uint t = xcl_tri[j];\n        if (xcl_tb + j >= {maxp}u) break;");
                     let _ = writeln!(
@@ -4848,6 +4864,7 @@ impl Em {
                         let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & 8191u]);", 4 * slot + c, 16 * r + 4 * c as u32);
                     }
                 }
+                gs_misc_store(&mut h, &g.outputs, rec.misc_dword());
                 h.push_str("    }\n");
                 let _ = writeln!(h, "    for (uint j = 0u; j < xcl_ntri; j++) {{\n        uint t = xcl_tri[j];\n        if (xcl_tb + j >= {maxp}u) break;");
                 let _ = writeln!(
@@ -4944,7 +4961,43 @@ fn out_struct(h: &mut String, name: &str, outputs: &[SigElement]) {
         let ty = if n == 1 { hlsl_type(e).to_string() } else { format!("{}{n}", hlsl_type(e)) };
         let _ = writeln!(h, "    {ty} p{k} : {};", e.semantic());
     }
+    layer_fields(h, outputs);
     h.push_str("};\n");
+}
+
+const LAYER_FIELDS: [(u32, &str, &str); 2] =
+    [(SV_RENDER_TARGET_ARRAY_INDEX, "xcl_layer", "SV_RenderTargetArrayIndex"), (SV_VIEWPORT_ARRAY_INDEX, "xcl_viewport", "SV_ViewportArrayIndex")];
+
+fn layer_fields(h: &mut String, outputs: &[SigElement]) {
+    for (sv, field, semantic) in LAYER_FIELDS {
+        if layer_output(outputs, sv).is_some() {
+            let _ = writeln!(h, "    nointerpolation uint {field} : {semantic};");
+        }
+    }
+}
+
+fn misc_field_value(system_value: u32, misc: &str) -> String {
+    if system_value == SV_RENDER_TARGET_ARRAY_INDEX {
+        format!("({misc} & {MISC_LAYER_MASK}u)")
+    } else {
+        format!("({misc} >> {MISC_VIEWPORT_SHIFT}u)")
+    }
+}
+
+fn gs_misc_store(h: &mut String, outputs: &[SigElement], misc_dword: usize) {
+    if !has_misc_vector(outputs) {
+        return;
+    }
+    let lds = |sv: u32| match layer_output(outputs, sv) {
+        Some(e) => format!("xcl_lds[((src + {}u) >> 2) & 8191u]", 16 * e.register + 4 * e.mask.trailing_zeros().min(3)),
+        None => "0u".to_string(),
+    };
+    let _ = writeln!(
+        h,
+        "        res.Store((dst + {misc_dword}u) * 4u, ({} & {MISC_LAYER_MASK}u) | ({} << {MISC_VIEWPORT_SHIFT}u));",
+        lds(SV_RENDER_TARGET_ARRAY_INDEX),
+        lds(SV_VIEWPORT_ARRAY_INDEX)
+    );
 }
 
 /// Geometry shader for the console's rect lists (IASetPrimitiveTopology 17, AMD's
@@ -5045,7 +5098,30 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         let _ = writeln!(h, "    {ty} p{k} : {sem};");
     }
     h.push_str("};\n");
+    let misc = has_misc_vector(&ms.outputs);
+    if misc {
+        h.push_str("struct XclPrim {\n");
+        layer_fields(&mut h, &ms.outputs);
+        h.push_str("};\n");
+    }
     let (mv, mp, vd, rec) = (ms.max_vertices, ms.max_primitives, ms.vert_dwords(), ms.record_dwords());
+    let prim_out = |n: u32| if misc { format!(", out primitives XclPrim prims[{n}]") } else { String::new() };
+    let prim_fill = || -> String {
+        if !misc {
+            return String::new();
+        }
+        let mut f = format!(
+            "        uint m = select(bad, 0u, res.Load((rec + {MESH_HEADER}u + select(bad, 0u, x[0]) * {vd}u + {}u) * 4u));\n        XclPrim q;\n",
+            ms.misc_dword()
+        );
+        for (sv, field, _) in LAYER_FIELDS {
+            if layer_output(&ms.outputs, sv).is_some() {
+                let _ = writeln!(f, "        q.{field} = {};", misc_field_value(sv, "m"));
+            }
+        }
+        f.push_str("        prims[j] = q;\n");
+        f
+    };
     let t = ms.threads.clamp(1, 128);
     // one vertex from record dword address `b` into `o`
     let mut fill = String::from("        XclVert o;\n        o.pos = asfloat(res.Load4(b));\n");
@@ -5068,7 +5144,8 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     if split == 1 {
         let _ = writeln!(
             h,
-            "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
+            "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}]{})\n{{",
+            prim_out(mp)
         );
         let _ = writeln!(h, "    uint rec = gid.x * {rec}u;");
         let _ = writeln!(h, "    uint nv = min(res.Load(rec * 4u), {mv}u);\n    uint np = min(res.Load(rec * 4u + 4u), {mp}u);");
@@ -5081,6 +5158,7 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + j) * 4u);");
         h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
         h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
+        h.push_str(&prim_fill());
         h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), x);\n    }\n}\n");
         return h;
     }
@@ -5089,8 +5167,9 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     let ppg = mp.div_ceil(split);
     let _ = writeln!(
         h,
-        "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{}], out indices uint3 tris[{ppg}])\n{{",
-        3 * ppg
+        "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{}], out indices uint3 tris[{ppg}]{})\n{{",
+        3 * ppg,
+        prim_out(ppg)
     );
     let _ = writeln!(h, "    uint rec = (gid.x / {split}u) * {rec}u;\n    uint first = (gid.x % {split}u) * {ppg}u;");
     let _ = writeln!(h, "    uint nv = min(res.Load(rec * 4u), {mv}u);\n    uint np = min(res.Load(rec * 4u + 4u), {mp}u);");
@@ -5104,22 +5183,25 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     let _ = writeln!(h, "        uint b = (rec + {MESH_HEADER}u + select(bad, 0u, x[c]) * {vd}u) * 4u;");
     h.push_str(&fill);
     h.push_str("        verts[3u * j + c] = o;\n        }\n");
+    h.push_str(&prim_fill());
     h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), uint3(3u * j, 3u * j + 1u, 3u * j + 2u));\n    }\n}\n");
     h
 }
 
 /// D3D12's limit on what one mesh shader group outputs (vertex + primitive attributes).
 const MESH_OUTPUT_BYTES: u32 = 32768;
+const MESH_PRIMITIVE_REGISTER_BYTES: u32 = 16;
 
 /// Mesh groups the pass-through spends on one record: 1 when the record's vertices fit the
 /// mesh output limit as they are, else the triangles are split into runs whose own vertex
 /// copies (3 per triangle) fit. `elements`: output elements besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
     let vbytes = 16 * (1 + elements as u32);
-    if vbytes * ms.max_vertices <= MESH_OUTPUT_BYTES {
+    let pbytes = if has_misc_vector(&ms.outputs) { MESH_PRIMITIVE_REGISTER_BYTES } else { 0 };
+    if vbytes * ms.max_vertices + pbytes * ms.max_primitives <= MESH_OUTPUT_BYTES {
         return 1;
     }
-    let ppg = (MESH_OUTPUT_BYTES / (3 * vbytes)).max(1);
+    let ppg = (MESH_OUTPUT_BYTES / (3 * vbytes + pbytes)).max(1);
     ms.max_primitives.max(1).div_ceil(ppg)
 }
 
