@@ -66,6 +66,8 @@ pub(super) struct Em {
     safe_barrier: bool,
 }
 
+pub(super) const INDENT: &str = " ";
+
 /// Instructions without an effect in this execution model.
 const NOOPS: &[&str] = &[
     "s_nop", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_waitcnt_depctr",
@@ -559,7 +561,7 @@ impl Em {
 
     fn line(&mut self, s: &str) {
         for _ in 0..self.indent {
-            self.out.push_str("    ");
+            self.out.push_str(INDENT);
         }
         self.out.push_str(s);
         self.out.push('\n');
@@ -853,8 +855,9 @@ impl Em {
 
     pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
         let name = d.inst.name.to_ascii_lowercase();
-        let text = rdna2::format(d);
-        self.line(&format!("// {:04x}: {text}", d.pc));
+        if self.opt.source_comments {
+            self.line(&format!("// {:04x}: {}", d.pc, rdna2::format(d)));
+        }
         self.cur_pc = d.pc;
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {

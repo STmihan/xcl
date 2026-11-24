@@ -465,21 +465,25 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
+const UNOPTIMISED_ABOVE_HLSL_BYTES: usize = 3_700_000;
+const LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES: usize = 520_000;
+
+fn optimisation_level_for(hlsl_bytes: usize) -> Option<&'static str> {
+    if hlsl_bytes > UNOPTIMISED_ABOVE_HLSL_BYTES {
+        Some("-O0")
+    } else if hlsl_bytes > LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES {
+        Some("-O1")
+    } else {
+        None
+    }
+}
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
-    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
-    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
-    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
-    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
-    // compile). -O0 only as a safety net for enormous sources.
-    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
-    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
-        } else if src.len() > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
+        if let Some(level) = optimisation_level_for(src.len()) {
+            args.push(crate::util::wide(level));
         }
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
@@ -1235,5 +1239,19 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod optimisation_level_tests {
+    use super::*;
+
+    #[test]
+    fn level_follows_the_source_size() {
+        assert_eq!(optimisation_level_for(0), None);
+        assert_eq!(optimisation_level_for(LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES), None);
+        assert_eq!(optimisation_level_for(LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES + 1), Some("-O1"));
+        assert_eq!(optimisation_level_for(UNOPTIMISED_ABOVE_HLSL_BYTES), Some("-O1"));
+        assert_eq!(optimisation_level_for(UNOPTIMISED_ABOVE_HLSL_BYTES + 1), Some("-O0"));
     }
 }

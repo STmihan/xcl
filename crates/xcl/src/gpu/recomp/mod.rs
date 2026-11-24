@@ -495,11 +495,12 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    pub source_comments: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true, source_comments: false }
     }
 }
 
@@ -582,6 +583,8 @@ fn why(_at: u64, msg: &str) {
 
 /// (lo, hi, exit, nest, loop head of `continue`, targets entering the range)
 type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
+
+pub(super) const SOURCE_COMMENTS_ENV: &str = "XCL_RECOMP_COMMENTS";
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
 /// the prelude: 65 536) – console code that loops on what XCL passed it wrong (an address, a
@@ -901,7 +904,8 @@ fn emit_structured(
     blocks: &mut usize,
     flags: &mut BTreeSet<u64>,
 ) -> BTreeSet<u64> {
-    let pad = "    ".repeat(depth);
+    let step = emit::INDENT;
+    let pad = step.repeat(depth);
     let mut pending: BTreeSet<u64> = incoming.clone();
     let none = BTreeSet::new();
     // flags of the open `if (!(skip …)) {` around the following items
@@ -936,33 +940,33 @@ fn emit_structured(
             }
         }
         let d = depth + guard.is_some() as usize;
-        let ipad = "    ".repeat(d);
+        let ipad = emit::INDENT.repeat(d);
         if resolved {
             body.push_str(&format!("{ipad}{} = false;\n", skip_flag(s)));
         }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
-                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {LOOP_GUARD}\n"));
+                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}{step}{LOOP_GUARD}\n"));
                 let (lcont, lin) = if entry.is_none() { (Some(a), &inner) } else { (None, &none) };
                 let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, lcont, lin, d + 1, blocks, flags);
                 for &t in &r {
                     if t == latch {
-                        body.push_str(&format!("{ipad}    {} = false;\n", skip_flag(t)));
+                        body.push_str(&format!("{ipad}{step}{} = false;\n", skip_flag(t)));
                     } else {
-                        body.push_str(&format!("{ipad}    if ({}) break;\n", skip_flag(t)));
+                        body.push_str(&format!("{ipad}{step}if ({}) break;\n", skip_flag(t)));
                     }
                 }
                 r.remove(&latch);
                 match emit_block(c, em, body, latch, b, d + 1, blocks) {
-                    emit::Flow::Cond(cond, _) => body.push_str(&format!("{ipad}    if (!({cond})) break;\n")),
+                    emit::Flow::Cond(cond, _) => body.push_str(&format!("{ipad}{step}if (!({cond})) break;\n")),
                     // unconditional back edge: the loop is left through the skip flags' breaks
                     emit::Flow::Jump(_) | emit::Flow::JumpExpr(_) => {}
-                    _ => body.push_str(&format!("{ipad}    break;\n")),
+                    _ => body.push_str(&format!("{ipad}{step}break;\n")),
                 }
                 if let Some(u) = entry {
                     // rotated: the head after the latch, falling into the next iteration
                     for t in emit_structured(c, em, body, a, u, None, nest + 1, None, &none, d + 1, blocks, flags) {
-                        body.push_str(&format!("{ipad}    {} = false;\n", skip_flag(t)));
+                        body.push_str(&format!("{ipad}{step}{} = false;\n", skip_flag(t)));
                     }
                 }
                 body.push_str(&format!("{ipad}}}\n"));
@@ -1041,13 +1045,14 @@ fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
 
 /// Emit the blocks starting in [lo, hi) at nesting `depth`; loop ranges become `while`.
 fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, depth: usize, blocks: &mut usize, flags: &mut BTreeSet<u64>) {
-    let pad = "    ".repeat(depth);
+    let step = emit::INDENT;
+    let pad = step.repeat(depth);
     let mut i = c.leaders.partition_point(|&l| l < lo);
     while i < c.leaders.len() && c.leaders[i] < hi {
         let start = c.leaders[i];
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
-            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {LOOP_GUARD}\n"));
+            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}{step}{LOOP_GUARD}\n"));
             emit_range(c, em, body, a, b, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < b);
@@ -1057,10 +1062,10 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         if let Some(x) = structured_span(c, i, hi) {
             body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
             for t in emit_structured(c, em, body, start, x, None, 0, None, &BTreeSet::new(), depth + 1, blocks, flags) {
-                body.push_str(&format!("{pad}    {} = false;\n", skip_flag(t)));
+                body.push_str(&format!("{pad}{step}{} = false;\n", skip_flag(t)));
             }
             let next = if x == u64::MAX || !c.starts.contains(&x) { "0xFFFFFFFFu".to_string() } else { format!("{x}u") };
-            body.push_str(&format!("{pad}    pc = {next};\n{pad}}}\n"));
+            body.push_str(&format!("{pad}{step}pc = {next};\n{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < x);
             continue;
         }
@@ -1085,7 +1090,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
             emit::Flow::Cond(cond, t) => format!("pc = ({cond}) ? {t}u : {fallthrough};"),
             emit::Flow::End => "pc = 0xFFFFFFFFu;".to_string(),
         };
-        body.push_str(&format!("{pad}    {tail}\n{pad}}}\n"));
+        body.push_str(&format!("{pad}{step}{tail}\n{pad}}}\n"));
         *blocks += 1;
         i += 1;
     }
@@ -1333,7 +1338,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             leaders.insert(next);
         }
     }
-    let mut em = emit::Em::new(opt.clone());
+    let mut em = emit::Em::new(Options { source_comments: opt.source_comments || std::env::var_os(SOURCE_COMMENTS_ENV).is_some(), ..opt.clone() });
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode

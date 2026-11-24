@@ -6870,9 +6870,9 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     if (lane_id == 0u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x7BFFu), f16tof32(0x3C01u), f16tof32(0xFBFFu), 0u), 0u);\n\
     if (lane_id == 1u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x7BFFu), f16tof32(0x3C01u), f16tof32(0xFBFFu), 3u), 3u);\n\
     if (lane_id == 2u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x3C01u), f16tof32(0x3C01u), f16tof32(0xBC02u), 0u), 0u);\n";
-    let marker = "    v0 = select((((exec_lo >> lane_id) & 1u) != 0u), (v0), v0);\n";
-    assert!(hlsl.contains(marker), "unexpected kernel body:\n{hlsl}");
-    hlsl = hlsl.replace(marker, probe);
+    let marker = format!("{}v0 = select((((exec_lo >> lane_id) & 1u) != 0u), (v0), v0);\n", super::emit::INDENT);
+    assert!(hlsl.contains(&marker), "unexpected kernel body:\n{hlsl}");
+    hlsl = hlsl.replace(&marker, probe);
 
     let dxil = super::dxc::compile(&hlsl, "main", "cs_6_6", &[]).unwrap();
     let mut st = KernelState::default();
@@ -7451,4 +7451,42 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+#[test]
+fn source_comments_are_opt_in_and_effect_free_instructions_emit_nothing() {
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 129)], None),
+        ("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ("S_WAITCNT", "ENC_SOPP", &[("SIMM16", 0)], None),
+    ]);
+    let plain = translate(&code, &Options::default()).unwrap();
+    assert!(plain.complete(), "{:?}", plain.unsupported_why);
+    for absent in ["s_nop", "s_waitcnt", "s_mov_b32"] {
+        assert!(!plain.hlsl.contains(absent), "unexpected `{absent}`:
+{}", plain.hlsl);
+    }
+    let commented = translate(&code, &Options { source_comments: true, ..Options::default() }).unwrap().hlsl;
+    for listed in ["// 0000: s_mov_b32", "s_nop", "s_waitcnt"] {
+        assert!(commented.contains(listed), "missing `{listed}`:
+{commented}");
+    }
+    let without_comments: String = commented.lines().filter(|l| !l.trim_start().starts_with("// 00")).map(|l| format!("{l}
+")).collect();
+    assert_eq!(without_comments, plain.hlsl);
+}
+
+#[test]
+fn nested_blocks_indent_by_one_step() {
+    let code = prog(&[
+        ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 129)], None),
+    ]);
+    let hlsl = translate(&code, &Options::default()).unwrap().hlsl;
+    let step = super::emit::INDENT;
+    let block_start = format!("\n{step}if (!(scc == 0u)) {{\n");
+    let opened = hlsl.find(&block_start).expect("block one step deep");
+    let body = &hlsl[opened + block_start.len()..];
+    assert!(body.starts_with(&step.repeat(2)) && !body.starts_with(&step.repeat(3)), "{hlsl}");
+    assert!(body.contains(&format!(";\n{step}}}\n")), "{hlsl}");
 }
