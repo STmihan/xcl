@@ -146,6 +146,14 @@ those two would go to `-O3` and 1 434 programs (one window) would be new at `-O1
 The split wave64 form NVIDIA GPUs get (`Options::split_wave64`) was not calibrated:
 `xcl shaders --recomp` does not produce it.
 
+Memory windows from the descriptor heap (`Options::heap_windows`, `XCL_HEAP_WINDOWS=1`) change only the
+accessor functions that `emit::windowed` writes once per program after its text: with one memory
+window nothing, with several only those accessors (no `switch` over the windows). The limits and
+`GUARDS_OUTWEIGH_THE_CODE` (measured on the body, before the accessors) were left as they are: all
+26 698 programs of the pack gave byte-identical HLSL from `xcl shaders --recomp` before and after
+that change came in. The heap form itself was not calibrated either, for the same reason as the
+split form.
+
 Any change that makes the HLSL of every program smaller or larger moves programs across this limit.
 Repeat the comparison: dump every program before and after with `XCL_DUMP_HLSL` and
 `XCL_DUMP_EVERY=1`, join the sizes by file name, and move the limit with it. The `-O0` limit stays.
