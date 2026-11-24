@@ -495,6 +495,8 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// a `// pc: disassembly` line before every instruction's HLSL (true, or `XCL_RECOMP_COMMENTS`):
+    /// for reading a dump – a third of the text of a large program, nothing in its DXIL
     pub source_comments: bool,
 }
 
@@ -584,6 +586,7 @@ fn why(_at: u64, msg: &str) {
 /// (lo, hi, exit, nest, loop head of `continue`, targets entering the range)
 type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
 
+/// Environment switch for `Options::source_comments` (a debug override: `pso::cache_allowed`).
 pub(super) const SOURCE_COMMENTS_ENV: &str = "XCL_RECOMP_COMMENTS";
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in

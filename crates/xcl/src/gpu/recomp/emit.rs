@@ -66,6 +66,8 @@ pub(super) struct Em {
     safe_barrier: bool,
 }
 
+/// One nesting level of the emitted HLSL. One space: large programs nest 15+ levels deep and
+/// four spaces per level were over half their bytes.
 pub(super) const INDENT: &str = " ";
 
 /// Instructions without an effect in this execution model.
@@ -80,10 +82,12 @@ fn is_identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Whether `expression` reads `identifier` as a whole token (`s1` is not in `s10`).
 fn mentions_identifier(expression: &str, identifier: &str) -> bool {
     expression.split(|c| !is_identifier_char(c)).any(|token| token == identifier)
 }
 
+/// `expression` with every whole-token `from` replaced by `to`.
 fn replace_identifier(expression: &str, from: &str, to: &str) -> String {
     let mut replaced = String::with_capacity(expression.len());
     let mut rest = expression;
@@ -1312,6 +1316,7 @@ impl Em {
             "s_pack_hh_b32_b16" => (format!("({a} >> 16) | ({b} & 0xFFFF0000u)"), None),
             _ => return Err("SALU"),
         };
+        // a register moved onto itself
         if name == "s_mov_b32" && is_register_named(&dst, &a) {
             return Ok(());
         }
@@ -1334,6 +1339,9 @@ impl Em {
         temps
     }
 
+    /// s_*_saveexec / s_*_wrexec: exec = `new_exec`, SCC = exec != 0, dst = the old exec (or the
+    /// new one for wrexec). Buffers only what a later write would clobber: nothing when dst does
+    /// not feed the new mask, the old exec when it does, both when dst is exec itself.
     fn write_saveexec(&mut self, dst: &Dst, dst_gets_new_exec: bool, exec: &[String], new_exec: &[String]) {
         let exec_dst = Dst::S(126);
         let nonzero = format!("scc = (uint)(({}) != 0u);", exec.join(" | "));
@@ -1368,6 +1376,10 @@ impl Em {
         }
     }
 
+    /// `dst = value; scc = cond(dst)` – `scc` is written over `temp`, which stands for the
+    /// result. The temporary is only declared when the SCC condition still reads the old
+    /// destination (s_add_u32 s0, s0, s1: carry = result < s0) or there is no register to read
+    /// the result back from.
     fn write_scalar_result(&mut self, dst: &Dst, temp: &str, value: &str, scc: Option<&str>) {
         let register = scalar_register_name(dst);
         let scc_reads_register = register.as_ref().is_some_and(|r| scc.is_some_and(|c| mentions_identifier(c, r)));
@@ -1389,6 +1401,9 @@ impl Em {
         }
     }
 
+    /// 64-bit form of `write_scalar_result`: the low half is written before the high one is
+    /// evaluated, so a high half reading the low destination (s_mov_b64 s[8:9], s[7:8]) keeps
+    /// the temporaries; a pair moved onto itself writes nothing.
     fn write_scalar_pair_result(&mut self, dst: &Dst, temps: (&str, &str), values: (&str, &str), scc: Option<&str>) {
         let registers = scalar_register_pair_names(dst);
         let overlaps = registers.as_ref().is_some_and(|(lo, hi)| {

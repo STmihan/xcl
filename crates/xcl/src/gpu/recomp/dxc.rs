@@ -465,9 +465,16 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
+/// HLSL larger than this compiles at -O0 (was 8 MiB while the HLSL carried a comment per
+/// instruction and four-space indentation; rescaled so the same programs stay at -O0 –
+/// calibration in docs/code/recompiler-hlsl-size.md).
 const UNOPTIMISED_ABOVE_HLSL_BYTES: usize = 3_700_000;
+/// HLSL larger than this compiles at -O1 (was 1 MiB, rescaled the same way: every program that
+/// had -O1 keeps it).
 const LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES: usize = 520_000;
 
+/// The DXC optimisation level for a source of this size when the caller names none (`None`:
+/// DXC's default, -O3).
 fn optimisation_level_for(hlsl_bytes: usize) -> Option<&'static str> {
     if hlsl_bytes > UNOPTIMISED_ABOVE_HLSL_BYTES {
         Some("-O0")
@@ -481,6 +488,14 @@ fn optimisation_level_for(hlsl_bytes: usize) -> Option<&'static str> {
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
+    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
+    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
+    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
+    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
+    // compile). -O0 only as a safety net for enormous sources.
+    // -O1 for large sources (from 1 MB on when measured, `LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES`
+    // now): the same DXIL size at a quarter less time (a retail game's then 4.8 MB HLSL of
+    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     if !extra.iter().any(|a| a.starts_with("-O")) {
         if let Some(level) = optimisation_level_for(src.len()) {
             args.push(crate::util::wide(level));
