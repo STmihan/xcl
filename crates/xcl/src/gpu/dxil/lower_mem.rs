@@ -638,9 +638,21 @@ impl Lw {
 
     pub fn smem(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         if name == "s_memtime" || name == "s_memrealtime" {
+            // no clock here: a counter that moves on every read, as the HLSL path's
+            // `xcl_clock_reads` (a constant 0 never ends a loop waiting for the clock)
+            use super::lower::{VAR_CLOCK_HI, VAR_CLOCK_LO};
             let sdata = Self::field(d, "SDATA");
-            let z = self.c(0);
-            self.write64(&Dst::S(sdata), z, z);
+            let lo = self.rd(VAR_CLOCK_LO);
+            let hi = self.rd(VAR_CLOCK_HI);
+            let lo = self.addc(lo, 1);
+            let wrapped = self.cmpc(super::module::Pred::Eq, lo, 0);
+            let one = self.c(1);
+            let zero = self.c(0);
+            let carry = self.sel(wrapped, one, zero);
+            let hi = self.add(hi, carry);
+            self.wr(VAR_CLOCK_LO, lo);
+            self.wr(VAR_CLOCK_HI, hi);
+            self.write64(&Dst::S(sdata), lo, hi);
             return Ok(());
         }
         let count = match name.trim_start_matches("s_buffer_load_").trim_start_matches("s_load_") {

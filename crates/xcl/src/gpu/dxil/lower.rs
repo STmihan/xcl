@@ -29,6 +29,10 @@ pub const VAR_WIN: u32 = VAR_BUDGET + 2;
 /// arrived" flag (`xcl_xk`, `xcl_x_dead`)
 pub const VAR_XK: u32 = VAR_BUDGET + 3;
 pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
+/// `s_memtime` / `s_memrealtime`: a 64-bit counter that moves on every read (low, high
+/// dword; the recompiler's `xcl_clock_reads`), so loops waiting for the clock end
+pub const VAR_CLOCK_LO: u32 = VAR_BUDGET + 5;
+pub const VAR_CLOCK_HI: u32 = VAR_BUDGET + 6;
 /// loop iterations a lane may run (the recompiler's `xcl_budget`)
 pub const LOOP_BUDGET: u32 = 1 << 16;
 
@@ -80,7 +84,7 @@ impl Init {
         if var == VAR_BUDGET {
             return s.m.i32c(LOOP_BUDGET);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD {
+        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || var == VAR_CLOCK_LO || var == VAR_CLOCK_HI {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
