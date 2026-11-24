@@ -606,6 +606,9 @@ impl Input {
     }
 }
 
+/// `XCL_SKIP_PIPELINE_DXIL=<fnv64>,…`: programs whose pipeline `--pipelines` does not build
+/// (DXIL FNV-64 as logged at "pipeline build starts"); for ones the driver's compiler cannot
+/// finish within the machine's memory.
 const SKIP_PIPELINE_DXIL_VAR: &str = "XCL_SKIP_PIPELINE_DXIL";
 
 fn skipped_pipeline_dxil() -> &'static std::collections::HashSet<u64> {
@@ -615,6 +618,13 @@ fn skipped_pipeline_dxil() -> &'static std::collections::HashSet<u64> {
             .map(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect())
             .unwrap_or_default()
     })
+}
+
+/// Whether this is the first `--pipelines` build of this DXIL: the pack holds identical
+/// programs, and two workers compiling the same one waste a driver build (minutes for 1 MB).
+fn first_pipeline_of_dxil(dxil_hash: u64, dxil_len: usize) -> bool {
+    static STARTED: std::sync::Mutex<Option<std::collections::HashSet<(u64, usize)>>> = std::sync::Mutex::new(None);
+    STARTED.lock().unwrap().get_or_insert_with(Default::default).insert((dxil_hash, dxil_len))
 }
 
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -776,11 +786,15 @@ impl Pipelines {
         }
     }
 
+    /// The compute pipeline of `c` (made and released).
     fn make(&self, c: &recomp::pso::Compiled) {
         use windows::Win32::Graphics::Direct3D12::*;
         let dxil_hash = crate::gpu::shader::fnv64(&c.dxil);
         if skipped_pipeline_dxil().contains(&dxil_hash) {
             eprintln!("  pipeline of DXIL {dxil_hash:016x} ({} B) skipped ({SKIP_PIPELINE_DXIL_VAR})", c.dxil.len());
+            return;
+        }
+        if !first_pipeline_of_dxil(dxil_hash, c.dxil.len()) {
             return;
         }
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
