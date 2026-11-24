@@ -466,7 +466,7 @@ unknown records), the result read with `bvh::Bvh::trace` = brute force on 500 ra
   still behind an `if`), VGPR write `v = select(active, value, v)`, the VALU path without a named temporary variable.
   Effect on the builder's shaders: 15 720 instructions – DXC `-O3` 5.8 s, 585 KB DXIL (before: > 150 s / driver:
   out of memory); the shader from yesterday's crash (1 589 instr.) – 0.3 s, 48 KB (before: ~6 min and > 30 GB).
-  **DXC optimizes everything again** (`-O0` only for > 8 MB of HLSL; since 2026-11-24 > 3.7 MB, the HLSL lost its comments and indentation: `docs/code/recompiler-hlsl-size.md`). A sample of 64 game shaders: 0 errors; median 0.29 s, p90 ~11 s.
+  **DXC optimizes everything again** (`-O0` only for > 8 MB of HLSL; since 2026-11-24 > 3.94 MB, the HLSL lost its comments and indentation: `docs/code/recompiler-hlsl-size.md`). A sample of 64 game shaders: 0 errors; median 0.29 s, p90 ~11 s.
 
 ### FSR4 for learning about textures (session 5, in progress)
 - Probe `fsr4_console_upscaler_creates_a_context_probe` (`XCL_PROBE_FSR=1`): `ffxCreateContext` with

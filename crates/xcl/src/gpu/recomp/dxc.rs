@@ -466,9 +466,9 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 }
 
 /// HLSL larger than this compiles at -O0 (was 8 MiB while the HLSL carried a comment per
-/// instruction and four-space indentation; rescaled so the same programs stay at -O0 –
+/// instruction and four-space indentation; rescaled so the same programs of one retail pack stay at -O0 in the native form –
 /// calibration in docs/code/recompiler-hlsl-size.md).
-const UNOPTIMISED_ABOVE_HLSL_BYTES: usize = 3_700_000;
+const UNOPTIMISED_ABOVE_HLSL_BYTES: usize = 3_940_000;
 /// HLSL larger than this compiles at -O1 (was 1 MiB, rescaled the same way: every program that
 /// had -O1 keeps it).
 const LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES: usize = 520_000;

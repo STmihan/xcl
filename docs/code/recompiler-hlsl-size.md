@@ -6,10 +6,18 @@ HLSL it writes, and how DXC's optimisation level is chosen from the size of that
 ## What is measured
 
 HLSL bytes are a proxy. What costs time and memory is DXC and, after it, the driver's compiler, which
-works on the DXIL. Comments and indentation never reach the DXIL: with the optimisation level pinned,
-stripping both from a 47 000-instruction compute program gave a byte-identical DXIL container.
-Single-use temporaries do reach it at `-O0` (about 5 bytes each, 0.6 % of that program's DXIL) and are
-gone at `-O1` and above.
+works on the DXIL. Measured on a 47 000-instruction compute program of a retail pack, DXC 1.9.2609,
+level pinned to `-O0`:
+
+- comments and indentation never reach the DXIL: stripping both gave a byte-identical container
+  (checked with DXC 1.8.2502);
+- everything described here together: HLSL 9.7 MB to 4.3 MB, DXIL 4 435 504 to 4 381 772 bytes
+  (-1.2 %). Single-use temporaries do reach the DXIL at `-O0`, a few bytes each;
+- DXC time: 151 s and 72 s before, 108 s and 101 s after, run alternately on a machine with other
+  load. Not distinguishable from noise.
+
+So the text changes make dumps and caches smaller and leave the driver's input almost as it was. The
+level does not: the same program at `-O1` gives 2 258 696 bytes of DXIL (51 %) and takes 542 s.
 
 ## Indentation
 
@@ -51,33 +59,31 @@ The check is by identifier (`mentions_identifier`), never by substring: `s1` is 
 
 ## DXC optimisation level
 
-`dxc::optimisation_level_for` picks the level from the HLSL size when the caller passes none:
+`dxc::optimisation_level_for` picks the level from the HLSL size when the caller passes none (why a
+level is chosen at all: the comment in `dxc::compile_here`):
 
-| HLSL bytes | level | why |
-| --- | --- | --- |
-| above `UNOPTIMISED_ABOVE_HLSL_BYTES` (3 700 000) | `-O0` | safety net for enormous sources |
-| above `LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES` (520 000) | `-O1` | same DXIL size as `-O3`, about a quarter less time |
-| otherwise | DXC default (`-O3`) | |
-
-History of the limits: DXC's optimiser was superlinear on translated programs full of short-circuit
-`?:` / `&&` / `if` per instruction (a 1 589-instruction console compute shader: about 6 minutes and
-more than 30 GB at `-O3`). With branch-free emission (`select` / `and` / `or`) it is fast: that shader
-0.3 s, a 15 720-instruction one 6 s (585 KB of DXIL against 1.6 MB at `-O0`, which the driver could not
-compile). `-O1` for large sources: a retail title's 19 600-instruction compute shader took 13.5 s
-instead of 17.7 s at `-O3`; `-O0` took 10.6 s but gave twice the DXIL.
+| HLSL bytes | level |
+| --- | --- |
+| above `UNOPTIMISED_ABOVE_HLSL_BYTES` (3 940 000) | `-O0` |
+| above `LIGHTLY_OPTIMISED_ABOVE_HLSL_BYTES` (520 000) | `-O1` |
+| otherwise | DXC default (`-O3`) |
 
 The limits were 8 MiB and 1 MiB while the HLSL carried comments and four-space indentation. They were
-rescaled when those went away so that no program gets a *higher* level than before. Calibration over
-all 26 698 programs of one retail shader pack (native form, one memory window), old size against new
-size of the same program:
+rescaled when those went away so that no program gets a *higher* level than before and none that had
+`-O1` drops to `-O0`. Calibration over all 26 698 programs of one retail shader pack, old size against
+new size of the same program, in the native form (wave64 not split):
 
-- the 6 programs above 8 MiB are now 4.03 MB and more; the 2 143 between 1 and 8 MiB are now
-  0.53 to 3.45 MB, so 3 700 000 separates the two groups exactly;
-- 520 000 keeps all of those 2 143 at `-O1`; 954 programs that were below 1 MiB (default level) now
-  also get `-O1`.
+| | one memory window | four windows (`XCL_RECOMP_WINDOWS=4`) |
+| --- | --- | --- |
+| programs above 8 MiB before | 6, now 4 029 730 bytes and more | 6, now 4 582 613 and more |
+| programs between 1 and 8 MiB before | 2 143, now 528 261 to 3 450 296 | 2 660, now 583 933 to 3 849 100 |
+| programs below 1 MiB before, now `-O1` | 954 | 1 035 |
 
-Any change that makes the HLSL of every program smaller or larger moves programs across these limits.
-Repeat the comparison (dump every program before and after with `XCL_DUMP_HLSL` and `XCL_DUMP_EVERY=1`,
-join the sizes by file name) and move the limits with it. For the largest programs the level matters
-far more than the text: the 47 000-instruction program above gives twice the DXIL at `-O0` than at
-`-O1`, and `-O1` takes several times longer.
+3 940 000 lies between 3 849 100 and 4 029 730, a margin of about 90 KB on either side. The split
+wave64 form NVIDIA GPUs get (`Options::split_wave64`) was not calibrated: `xcl shaders --recomp` does
+not produce it.
+
+Any change that makes the HLSL of every program smaller or larger moves programs across these limits
+(the smallest program that must stay at `-O0` is only 2 % above the limit). Repeat the comparison:
+dump every program before and after with `XCL_DUMP_HLSL` and `XCL_DUMP_EVERY=1`, join the sizes by
+file name, and move the limits with it.
