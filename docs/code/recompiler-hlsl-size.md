@@ -69,7 +69,7 @@ Structured control flow puts every item after a forward jump out of its level un
 thousands of crossing jumps the guards grow with the square of their number. One compute program of a
 retail pack (76 696 instructions, 3 861 skip flags) came to 111 318 363 bytes of HLSL, 92 % of it
 guard lines (152 MB in the form with comments and four-space indentation); as the guarded block chain
-the same program is 4 819 218 bytes. DXC 1.9.2609 does not get through the structured form at any
+the same program is 4 819 218 bytes. DXC 1.9 does not get through the structured form at any
 level: its memory went past 40 GB within 55 s at `-O1` and past 32 GB within 28 s at `-O0` (both runs
 were ended there; the 152 MB form went past 12 GB within 21 s at `-O0`).
 
@@ -108,7 +108,7 @@ smaller must leave it alone – every program only moves further below it, in ev
 four memory windows, `XCL_RECOMP_COMMENTS`). In the pack the largest HLSL is now 9 302 789 bytes
 with one memory window and 10 330 079 with four: nothing is compiled at `-O0`.
 
-Measured with DXC 1.9.2609 (`dxc.exe -E main -T cs_6_6 -HV 2021 -O1`, one at a time), the HLSL of
+Measured with DXC 1.9 (`dxc.exe -E main -T cs_6_6 -HV 2021 -O1`), the HLSL of
 `xcl shaders --recomp` (one memory window, wave64 not split), before = the form with comments,
 four-space indentation, every SCC write and every select:
 
@@ -139,9 +139,9 @@ of the pack, size before (limit 1 MiB) against size now of the same program:
 | programs below 1 MiB before, now `-O1` | 2 006 | 2 039 |
 
 360 000 is 7 % below the smallest program that had `-O1`. The price of keeping all of them is that
-the number of programs at `-O1` about doubles: the two smallest shrank to 37 % of their size where
-most shrank to 45 – 60 %. With the limit at 450 000 those two would go to `-O3` and 1 434 programs
-(one window) would be new at `-O1`.
+the number of programs at `-O1` about doubles (one window: 2 199 before, 4 205 now): the two smallest
+shrank to 36 % and 33 % of their size, the third smallest is 458 366 bytes. With the limit at 450 000
+those two would go to `-O3` and 1 434 programs (one window) would be new at `-O1`.
 
 The split wave64 form NVIDIA GPUs get (`Options::split_wave64`) was not calibrated:
 `xcl shaders --recomp` does not produce it.
