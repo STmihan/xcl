@@ -64,6 +64,19 @@ const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
 
+/// `GPU_WAIT_WATCHDOG_TIMEOUT`, or `XCL_GPU_WAIT_RELEASE_MS` (a value above 0). A release on the
+/// CPU lets the waiting queue go on before its producer has written the value: when the producer
+/// is only late (its list held while a pipeline is built), the consumer reads what was not
+/// written yet.
+fn gpu_wait_watchdog_timeout() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| release_after(std::env::var("XCL_GPU_WAIT_RELEASE_MS").ok().as_deref()))
+}
+
+fn release_after(ms: Option<&str>) -> Duration {
+    ms.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map_or(GPU_WAIT_WATCHDOG_TIMEOUT, Duration::from_millis)
+}
+
 fn wait_timeout() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
     *T.get_or_init(|| {
@@ -1389,7 +1402,7 @@ fn wake_sync_watchdog() {
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
                         cell.armed_waits.retain(|aw| {
-                            if aw.armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
+                            if aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout() {
                                 if aw.val >= max_exp {
                                     max_exp = aw.val;
                                     waiter_q = aw.waiting_queue;
@@ -1439,7 +1452,7 @@ fn wake_sync_watchdog() {
                 let pq = prod_q.map(queue_id);
                 crate::xlog_warn!(
                     "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, prod=q{pq:?}/ty{prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
-                    GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
+                    gpu_wait_watchdog_timeout().as_millis()
                 );
             }
             if had_expired {
@@ -3846,6 +3859,15 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn a_gpu_wait_is_released_after_xcl_gpu_wait_release_ms_or_the_default() {
+        assert_eq!(release_after(None), GPU_WAIT_WATCHDOG_TIMEOUT);
+        assert_eq!(release_after(Some("180000")), Duration::from_secs(180));
+        assert_eq!(release_after(Some(" 750 ")), Duration::from_millis(750));
+        assert_eq!(release_after(Some("0")), GPU_WAIT_WATCHDOG_TIMEOUT, "0 keeps the default");
+        assert_eq!(release_after(Some("soon")), GPU_WAIT_WATCHDOG_TIMEOUT);
+    }
 
     static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);
     static RESET_TEST_REPLACEMENT_VT: AtomicU64 = AtomicU64::new(0);
