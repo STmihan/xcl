@@ -148,6 +148,9 @@ pub struct MsInterface {
     pub threads: u32,
     pub max_vertices: u32,
     pub max_primitives: u32,
+    /// the OSG1 register of each `exp param N` from the console's table (`vs_output_table`;
+    /// None: the N-th distinct register of `param_registers`)
+    pub params: Option<Vec<u32>>,
 }
 
 /// dwords before the vertices of a mesh record: vertex count, primitive count, 2 spare
@@ -214,6 +217,7 @@ impl GsInterface {
             threads: 64,
             max_vertices: (GS_PRIMS_PER_GROUP * mvc).clamp(1, 256),
             max_primitives: (GS_PRIMS_PER_GROUP * mvc.saturating_sub(2).max(1)).clamp(1, 256),
+            params: None,
         }
     }
 }
@@ -376,11 +380,15 @@ pub fn ps_input_table(fssm: &[u8]) -> Option<(u32, Vec<PsAttr>)> {
     Some((ena, out))
 }
 
-/// The VS output table of an FSSM: per `exp param N`, the OSG1 register it writes. 32 records
-/// of 6 bytes at +0x1D4 (+ the sub-version shift): kind (6 user, 0 position), register, param
-/// number, 0, 0, 0; the record count after them (+0xC0). Usually param N = the N-th output
-/// register, but not always (a Fortnite VS exports its SV_Position register as a param).
-/// Checked on every cached VS of three titles (984, 13, 1).
+/// The output table of a VS or MS FSSM: per `exp param N`, the OSG1 register it writes. 32
+/// records of 6 bytes at +0x1D4 (+ the sub-version shift): kind (6 user, 7 clip distance, 8
+/// cull distance, 0 position), register, param number, then three bytes in one of the
+/// `param_record_tail_known` forms; the record count after them (+0xC0). Usually param N = the N-th
+/// output register, but not always: a Fortnite VS exports its SV_Position register as a param,
+/// the console's compiler numbers only the registers a program writes, and a clip/cull
+/// register below a user one gets its param in register order (GTA VI: 1 605 MS put it first,
+/// `docs/code/recompiler-mesh-outputs.md`). Checked on every cached VS of three titles (984,
+/// 13, 1) and on every VS and MS of the GTA VI pack (2 236, 9 282).
 pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
     let base = 0x1D4 + fssm_shift(fssm)?;
     let n = fssm.get(base + 0xC0..base + 0xC4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))? as usize;
@@ -390,12 +398,20 @@ pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
     let mut out = Vec::with_capacity(n);
     for k in 0..n {
         let r = fssm.get(base + 6 * k..base + 6 * k + 6)?;
-        if r[2] as usize != k || r[3..6] != [0, 0, 0] {
+        if r[2] as usize != k || !param_record_tail_known(r) {
             return None;
         }
         out.push(r[1] as u32);
     }
     Some(out)
+}
+
+/// The last three bytes of an output-table record, as seen over the GTA VI pack (records of
+/// 2 236 VS and 9 282 MS): zeros (46 811), the record's register, 0, 3 (12 656; meaning
+/// unknown) and 0, 0, 1 (67). Other titles' tables had zeros only. A tail outside these forms
+/// means the bytes at +0x1D4 are not this table.
+fn param_record_tail_known(r: &[u8]) -> bool {
+    matches!(r[3..6], [0, 0, 0] | [0, 0, 1]) || (r[3] == r[1] && r[4..6] == [0, 3])
 }
 
 /// The register `v_interp attr` reads: the console's table, else the attr-th distinct register.
@@ -425,9 +441,19 @@ pub fn ps_slot_attribute(ps: &PsInterface, slot: usize) -> Option<usize> {
 
 /// The register `exp param N` of a VS writes: the console's table, else the N-th distinct one.
 pub fn vs_param_register(vs: &VsInterface, n: usize) -> Option<u32> {
-    match &vs.params {
+    param_register(vs.params.as_deref(), &vs.outputs, n)
+}
+
+/// The register `exp param N` of an MS writes: the console's table, else the N-th distinct one
+/// (user registers, then clip/cull – the order of `ranked`, not the console's).
+pub fn ms_param_register(ms: &MsInterface, n: usize) -> Option<u32> {
+    param_register(ms.params.as_deref(), &ms.outputs, n)
+}
+
+fn param_register(table: Option<&[u32]>, outputs: &[SigElement], n: usize) -> Option<u32> {
+    match table {
         Some(t) => t.get(n).copied(),
-        None => param_registers(&vs.outputs, true).get(n).copied(),
+        None => param_registers(outputs, true).get(n).copied(),
     }
 }
 
@@ -475,6 +501,7 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
                 threads,
                 max_vertices: (p.ms_max_vertices as u32).clamp(1, 256),
                 max_primitives: (p.ms_max_primitives as u32).clamp(1, 256),
+                params: vs_output_table(&f.data),
             }))
         }
         _ => None,
@@ -1661,5 +1688,22 @@ mod attribute_tests {
         assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
         f[0x1D4 + 8] = 7;
         assert_eq!(vs_output_table(&f), None);
+    }
+
+    /// GTA VI's VS and MS output tables: a clip register first (kind 7) and the tails register,
+    /// 0, 3 and 0, 0, 1 the pack's records carry; any other tail is not the table.
+    #[test]
+    fn output_table_tails_of_the_gta_vi_pack() {
+        let mut f = vec![0u8; 0x400];
+        f[0x10] = 6;
+        let base = 0x1D4 + 8;
+        f[base..base + 18].copy_from_slice(&[7, 0, 0, 0, 0, 0, 6, 2, 1, 2, 0, 3, 6, 5, 2, 0, 0, 1]);
+        f[base + 0xC0] = 3;
+        assert_eq!(vs_output_table(&f), Some(vec![0, 2, 5]));
+        f[base + 9] = 3;
+        assert_eq!(vs_output_table(&f), None, "register, 0, 3 names another register");
+        f[base + 9] = 2;
+        f[base + 17] = 2;
+        assert_eq!(vs_output_table(&f), None, "0, 0, 2");
     }
 }

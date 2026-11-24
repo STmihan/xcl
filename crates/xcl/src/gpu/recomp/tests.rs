@@ -2823,7 +2823,7 @@ fn gpu_mesh_mode_two_passes() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128, params: None };
     let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
         ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
     };
@@ -3141,7 +3141,7 @@ fn gpu_mesh_mode_reads_memory_windows() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64, params: None };
     let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
         ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
         ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None), // thread
@@ -5688,7 +5688,7 @@ fn far_jumps_are_direct_branches() {
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
 #[test]
 fn mesh_split_wave64_form() {
-    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] };
+    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![], params: None };
     let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
     let branch = prog(&[("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None)]);
     for code in [&lane, &branch] {
@@ -8022,4 +8022,43 @@ fn a_program_with_more_guard_than_code_is_emitted_as_the_block_chain() {
     let r = runner::run_code(&code, &st, &[]).unwrap();
     let targets_run: u32 = (TAKEN_AT as usize..jumps).map(step).sum();
     assert_eq!((r.sgpr[1], r.sgpr[2]), (TAKEN_AT + 1, targets_run));
+}
+
+/// An MS's `exp param N` writes the register of the console's output table, not the N-th of
+/// XCL's order (user registers, then clip/cull): a clip-distance register below the user ones
+/// is param 0 on the console, and a register the program never writes gets no param. The
+/// record slot follows `ranked` (TEXCOORD0, TEXCOORD1, TEXCOORD2, SV_ClipDistance0), so the
+/// pass-through hands each semantic what the console's pixel shader reads at its register.
+#[test]
+fn mesh_params_follow_the_console_output_table() {
+    let sig = |name: &str, index: u32, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0,
+        stream: 0,
+    };
+    let outputs = vec![sig("SV_ClipDistance", 0, 2, 0), sig("TEXCOORD", 0, 0, 1), sig("TEXCOORD", 1, 0, 2), sig("TEXCOORD", 2, 0, 3), sig("SV_Position", 0, 1, 4)];
+    let exp = |tgt: u64, src: u64| ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", 0xF), ("VSRC0", src), ("VSRC1", src), ("VSRC2", src), ("VSRC3", src)], None);
+    let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![exp(32, 10), exp(33, 11), exp(34, 12)];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let stores = |params: Option<Vec<u32>>| {
+        let ms = super::MsInterface { outputs: outputs.clone(), threads: 64, max_vertices: 64, max_primitives: 64, params };
+        let t = super::translate_mesh(&code, ms, true, false, 1).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        t.hlsl
+    };
+    let slot_of = |hlsl: &str, vgpr: u32| -> Vec<usize> {
+        (1..=4).filter(|s| hlsl.contains(&format!("res.Store((xcl_vtx + {}u) * 4u, v{vgpr})", 4 * s))).map(|s| s - 1).collect()
+    };
+    // the console's table: clip register 0 is param 0, TEXCOORD1 (register 2) is never written
+    let console = stores(Some(vec![0, 1, 3]));
+    assert_eq!((slot_of(&console, 10), slot_of(&console, 11), slot_of(&console, 12)), (vec![3], vec![0], vec![2]));
+    // without the table: XCL's own order, the clip distances last
+    let own = stores(None);
+    assert_eq!((slot_of(&own, 10), slot_of(&own, 11), slot_of(&own, 12)), (vec![0], vec![1], vec![2]));
 }
