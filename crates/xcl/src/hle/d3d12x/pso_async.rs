@@ -351,6 +351,13 @@ struct Preload {
     cv: Condvar,
 }
 
+/// How often a preload worker looks again whether the title still waits for a bind's build
+/// before it takes its next pipeline. A worker takes no new build while a bind waits: in a
+/// retail title's world load six driver compiles ran at once (two ahead of their use, two of the
+/// driver's own background compiles), the title waited for one or two of them, and the
+/// process's commit grew 10 GB in 45 s up to the memory guard.
+const PRELOAD_YIELD_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 fn preload() -> Option<&'static Preload> {
     static Q: OnceLock<Option<Preload>> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -372,6 +379,10 @@ fn preload() -> Option<&'static Preload> {
                 }
                 static DONE: AtomicUsize = AtomicUsize::new(0);
                 loop {
+                    // (while a bind waits for its own pipeline, the driver's compiler is left to it)
+                    while title_held() {
+                        std::thread::sleep(PRELOAD_YIELD_POLL);
+                    }
                     let p = {
                         let mut g = q.list.lock().unwrap();
                         loop {
