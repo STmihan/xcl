@@ -5246,6 +5246,17 @@ fn is_fence(p: usize) -> bool {
 /// first queue slot `queue_dispatch` handles
 const QUEUE_FIRST: usize = 14;
 
+/// The queue method at `slot` in the older layout's numbering (`usize::MAX`: none there).
+fn older_queue_slot(slot: usize, shifted: bool) -> usize {
+    if shifted && slot >= 16 {
+        slot - 2
+    } else if shifted {
+        usize::MAX
+    } else {
+        slot
+    }
+}
+
 /// A title's call of queue slot `slot` (arguments as integers; Signal / Wait / SignalX /
 /// PresentX / GetTimestampFrequency / GetClockCalibration / GetDesc all fit).
 unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
@@ -5261,8 +5272,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     if (slot == 14 || slot == 15) && !shifted && is_fence(a1) {
         QUEUE_OLDER.store(true, Ordering::Release);
     }
-    // the method in the older layout's numbering
-    let older = if shifted && slot >= 16 { slot - 2 } else if shifted { usize::MAX } else { slot };
+    let older = older_queue_slot(slot, shifted);
     let pc = |s: usize| orig_fn(this, s);
     match older {
         // Signal / Wait take a fence: anything else is not one of them
@@ -5321,6 +5331,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             q_execute_command_lists(this, a1 as u32, a2 as *const *mut c_void);
             0
         }
+        29 if shifted || QUEUE_OLDER.load(Ordering::Acquire) => super::page_mappings::copy_page_mappings_batch(a1 as u32, a2 as *const u8, a3 as u64, a4 as u32),
         _ => {
             // a console method not modelled: logged once, S_OK (as the stubs it replaces; frame
             // pacing on queue methods keeps working for titles without PresentX)
@@ -5988,6 +5999,13 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn copy_page_mappings_batch_is_newer_31_and_older_29() {
+        assert_eq!(older_queue_slot(31, true), 29);
+        assert_eq!(older_queue_slot(29, false), 29);
+        assert_eq!(older_queue_slot(29, true), 27);
     }
 }
 
