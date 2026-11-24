@@ -2553,7 +2553,12 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
-        Kind::Fence => v.push(("Signal", fence_signal as usize)),
+        Kind::Fence => {
+            v.push(("Signal", fence_signal as usize));
+            if super::wait_trace::on() {
+                v.push(("SetEventOnCompletion", fence_set_event_on_completion as usize));
+            }
+        }
         _ => {}
     }
     v
@@ -5567,6 +5572,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                     super::fence_x::note_queue_wait(a1, a2 as u64);
                     super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
                 }
+                if super::wait_trace::on() {
+                    super::wait_trace::note_title_fence_op(this as usize, a1, older == 14);
+                }
             }
             hr as u32 as usize
         }
@@ -5657,8 +5665,19 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
+        if super::wait_trace::on() {
+            super::wait_trace::note_title_fence_op(this as usize, fence as usize, true);
+        }
     }
     hr
+}
+
+/// Fence::SetEventOnCompletion, hooked only with `XCL_WAIT_TRACE`: the title's own event waits
+/// (its threads wait on the event in the system, out of XCL's sight)
+unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
+    super::wait_trace::note_set_event(this, value, event as usize);
+    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
+    f(this, value, event)
 }
 
 /// Fence::Signal (CPU)
@@ -5690,6 +5709,9 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    if super::wait_trace::on() {
+        super::wait_trace::submitted(this, std::slice::from_raw_parts(lists, n as usize), &mapped);
+    }
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::list_x::copy_scratch_submitted(this, chunk);

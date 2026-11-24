@@ -17,6 +17,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::console_list::{self, Layout, Param};
+use super::wait_trace::{SkipKind, SkipWhy};
 
 #[derive(Default)]
 struct State {
@@ -67,6 +68,22 @@ fn count(k: usize) {
 
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
+}
+
+/// `XCL_WAIT_TRACE`: a draw or dispatch on `list` was skipped – with the bound pipeline and the
+/// address arguments of the root signature it uses (the graphics one for a draw).
+fn trace_skip(list: *mut c_void, kind: SkipKind, why: SkipWhy) {
+    if !super::wait_trace::on() {
+        return;
+    }
+    let (pso, roots) = with(list, |s| {
+        let (layout, args) = match kind {
+            SkipKind::Draw => (s.layout_gfx.as_deref(), &s.args_gfx),
+            SkipKind::Dispatch => (s.layout.as_deref(), &s.args),
+        };
+        (s.pso, super::wait_trace::roots(layout, args))
+    });
+    super::wait_trace::note_skip(list, kind, why, pso, roots);
 }
 
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
@@ -272,6 +289,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     super::pso_async::note_skipped_draw();
                 }
             }
+            let why = if unbuilt { SkipWhy::Budget } else { SkipWhy::Building };
+            trace_skip(this, if signature_dispatches(sig) { SkipKind::Dispatch } else { SkipKind::Draw }, why);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -284,6 +303,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
         // A native PC compute pipeline is not one of these and still goes to the PC call.
         if signature_dispatches(sig) && super::real::is_console_compute(pso) {
+            trace_skip(this, SkipKind::Dispatch, SkipWhy::Untranslated);
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -511,6 +531,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if unbuilt {
         count(DRAWS_SKIPPED);
         super::pso_async::note_skipped_draw();
+        trace_skip(this, SkipKind::Draw, SkipWhy::Budget);
         return None;
     }
     if !super::real::is_translated_graphics(resolved) {
@@ -825,6 +846,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         if unbuilt {
             super::pso_async::note_skipped_dispatch();
         }
+        trace_skip(this, SkipKind::Dispatch, if unbuilt { SkipWhy::Budget } else { SkipWhy::Untranslated });
         // a console pipeline without a translation (including a background build that
         // failed): nothing to run (its root arguments were not given to the PC list either)
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

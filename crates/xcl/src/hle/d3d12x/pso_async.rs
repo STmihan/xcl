@@ -813,6 +813,12 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
     PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
+/// The key of stand-in `pso`'s shaders (as `XCL_PSO_PRELOAD` and the build log name it; 0: not
+/// a stand-in, or no key) – `XCL_WAIT_TRACE`.
+pub fn trace_key(pso: usize) -> u64 {
+    entry(pso).map_or(0, |p| p.key)
+}
+
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };

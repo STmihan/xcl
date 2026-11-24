@@ -1120,6 +1120,72 @@ fn queue_id(q: usize) -> usize {
     }
 }
 
+/// The short id the log gives `queue` (`q0`, `q1` …) – `XCL_WAIT_TRACE`.
+pub(super) fn queue_label_id(queue: usize) -> usize {
+    queue_id(queue)
+}
+
+/// `queue`'s short id and command list type (-1: unknown) – `XCL_WAIT_TRACE`.
+pub(super) unsafe fn queue_label(queue: *mut c_void) -> (usize, i32) {
+    (queue_id(queue as usize), queue_device_and_type(queue).map_or(-1, |(_, _, t)| t.0))
+}
+
+/// How many `Write64BitValue*` signals and memory waits `list` recorded – `XCL_WAIT_TRACE`.
+pub(super) fn sync_counts(list: *mut c_void) -> (usize, usize) {
+    let g = LISTS.lock().unwrap();
+    g.as_ref().and_then(|m| m.get(&(list as usize))).map_or((0, 0), |s| (s.write64_signals.len(), s.pending_waits.len()))
+}
+
+/// A `Wait64BitValueX` bridged to a GPU `queue.Wait` not yet seen completed – `XCL_WAIT_TRACE`.
+pub(super) struct ArmedSnapshot {
+    pub va: u64,
+    pub value: u64,
+    /// queue ids as the log gives them
+    pub waiter: usize,
+    pub waiter_ty: i32,
+    pub armed_at: Instant,
+    /// the cell fence's completed value
+    pub completed: u64,
+    pub recorded: u64,
+    pub submitted: u64,
+    /// None: last released on the CPU
+    pub producer: Option<usize>,
+}
+
+pub(super) fn armed_waits_snapshot() -> Vec<ArmedSnapshot> {
+    let raw: Vec<(u64, u64, usize, i32, Instant, u64, u64, u64, Option<usize>)> = {
+        let g = SYNC_GRAPH.lock().unwrap();
+        let Some(graph) = g.as_ref() else { return Vec::new() };
+        let mut out = Vec::new();
+        for (&va, cell) in graph.cells.iter() {
+            if cell.armed_waits.is_empty() {
+                continue;
+            }
+            let completed = cell.fence.as_ref().map_or(0, |f| unsafe { f.GetCompletedValue() });
+            for aw in &cell.armed_waits {
+                if aw.val <= completed {
+                    continue;
+                }
+                out.push((va, aw.val, aw.waiting_queue, aw.waiting_queue_ty, aw.armed_at, completed, cell.recorded_max, cell.submitted_max, cell.submitted_queue));
+            }
+        }
+        out
+    };
+    raw.into_iter()
+        .map(|(va, value, waiter, waiter_ty, armed_at, completed, recorded, submitted, producer)| ArmedSnapshot {
+            va,
+            value,
+            waiter: queue_id(waiter),
+            waiter_ty,
+            armed_at,
+            completed,
+            recorded,
+            submitted,
+            producer: producer.map(queue_id),
+        })
+        .collect()
+}
+
 /// Remove any `armed_waits` and `submitted_signals` already satisfied on the GPU (or if the device
 /// was removed). Returns the fence's current completed value (or `0` if no fence exists yet).
 unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
@@ -1863,7 +1929,12 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
-        if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
+        let traced = super::wait_trace::on().then(|| super::wait_trace::memory_wait_begin(queue as usize, q_ty, w.va, w.width, w.comparison, w.value, w.mask));
+        let satisfied = w.wait_until_satisfied(timeout);
+        if let Some(token) = traced {
+            super::wait_trace::memory_wait_end(token, satisfied);
+        }
+        if !satisfied && once(&TIMEOUTS, 40) {
             let cell_diag = {
                 let g = SYNC_GRAPH.lock().unwrap();
                 g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0)))

@@ -824,6 +824,11 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             if unbuilt {
                                 super::pso_async::note_skipped_dispatch();
                             }
+                            if super::wait_trace::on() {
+                                use super::wait_trace::{SkipKind, SkipWhy};
+                                let why = if unbuilt { SkipWhy::Budget } else { SkipWhy::Untranslated };
+                                super::wait_trace::note_skip(obj as *mut c_void, SkipKind::Dispatch, why, (*p).pc, super::wait_trace::roots(layout.as_deref(), &table));
+                            }
                             out.skipped_dispatches += 1;
                             continue;
                         }
