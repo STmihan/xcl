@@ -38,8 +38,14 @@ Counts over the pack (`shaders.rpf`, 9 282 MS and 2 236 VS programs, 2026-11-24)
   sources equal `pos1`'s is exactly the param the table's kind 7/8 record names. That param is
   the clip register's place in register order (often param 0), not the last param, as XCL
   assumed. In 1 605 of these MS, XCL put the clip register in a different place.
-- A register the program never writes gets no param. For example, with registers 1, 2, 3, 4 and
-  the table 1, 2, 4, the console's param 2 is register 4, but XCL took it as register 3.
+- Registers without a record get no param. The OSG1 never-written mask is 0 throughout, so it
+  cannot tell which registers a program writes. For example, with registers 1, 2, 3, 4 and the
+  table 1, 2, 4, the console's param 2 is register 4, but XCL took it as register 3. For the
+  3 153 MS without clip/cull whose table differs from XCL's order, a param's `exp` component
+  mask (EN) was compared with the masks of the two candidate registers, counting only where those
+  masks differ. EN equals the table register's mask 8 125 times and XCL's register's mask 1 771
+  times (798 match neither). Per program, the table fits better in 2 342 MS, XCL's order in 55,
+  and 756 tie.
 - The table's registers ascend strictly in every MS. In 8 VS they do not; those 8 were not
   examined.
 
@@ -61,6 +67,10 @@ the first 32 met (30 MS as `cs_6_6`, 2 VS as `vs_6_6`), all valid.
 
 ## Not covered
 
+- A static stand-in for pairs, a PS matched with every MS that has the same non-system output
+  semantics (57 392 candidates, most of them not real pairs), does not decide the direction.
+  In 727 of the candidates without clip/cull, the PS reads a semantic that the MS table leaves
+  unwritten. In 684, it reads one that XCL's old order left unwritten.
 - MS-to-PS pairs are only formed at run time (`pso::console_mesh(ms, Some(ps))`). The pack does
   not pair them statically, so the fix was checked per MS and not on real pairs. The visual effect
   (world geometry drawn as flat, unlit shapes) is a hypothesis that needs a run.
