@@ -3,8 +3,9 @@
 //!
 //! * `XCL_TRACE_PSO_STREAM=1`: one line per distinct stream given to CreatePipelineState – each
 //!   subobject's offset, type, payload size and hash (shaders: stage and blob hash, no bytes).
-//! * `XCL_CONSOLE_STREAM_TYPES=1`: a stream in the console's numbering (its MS container in type
-//!   24, the PC's AS) is rewritten in the PC's before anything reads it.
+//! * `XCL_CONSOLE_STREAM_TYPES` (on by default; `0`: off, `1`: on, anything else is an error): a
+//!   stream in the console's numbering (its MS container in type 24, the PC's AS) is rewritten in
+//!   the PC's before anything reads it.
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -158,9 +159,37 @@ fn trace_on() -> bool {
     *ON.get_or_init(|| env_on("XCL_TRACE_PSO_STREAM"))
 }
 
+const CONSOLE_STREAM_TYPES_VAR: &str = "XCL_CONSOLE_STREAM_TYPES";
+
+/// Whether `XCL_CONSOLE_STREAM_TYPES`'s value turns the console numbering on: unset or `1` on, `0`
+/// off, anything else (an empty value too) an error naming the variable.
+fn parse_remap(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(v) => Err(format!("{CONSOLE_STREAM_TYPES_VAR}={v:?} must be 0 (off) or 1 (on; unset is on too)")),
+    }
+}
+
+/// `XCL_CONSOLE_STREAM_TYPES` (on unless it is `0`). Panics on another value: it is read first by
+/// `check_remap`, when the D3D12 backend starts.
 fn remap_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_on("XCL_CONSOLE_STREAM_TYPES"))
+    *ON.get_or_init(|| match parse_remap(std::env::var(CONSOLE_STREAM_TYPES_VAR).ok().as_deref()) {
+        Ok(on) => on,
+        Err(e) => {
+            crate::xlog_error!("D3D12.X: {e}");
+            panic!("D3D12.X: {e}");
+        }
+    })
+}
+
+/// Reads `XCL_CONSOLE_STREAM_TYPES` (a malformed value ends the process here, not at the first
+/// CreatePipelineState) and logs it when it is off.
+pub(super) fn check_remap() {
+    if !remap_on() {
+        crate::xlog_info!("D3D12.X: {CONSOLE_STREAM_TYPES_VAR}=0: pipeline streams in the console's subobject numbering are passed as they are");
+    }
 }
 
 /// A D3D12_SHADER_BYTECODE payload's code, when it points at readable memory.
@@ -192,8 +221,8 @@ impl PcStream {
 }
 
 /// CreatePipelineState's stream: traced (`XCL_TRACE_PSO_STREAM`), and when it is in the
-/// console's numbering and `XCL_CONSOLE_STREAM_TYPES` is set, the PC-numbered copy to read and
-/// create instead.
+/// console's numbering and `XCL_CONSOLE_STREAM_TYPES` is not `0`, the PC-numbered copy to read
+/// and create instead.
 pub(super) unsafe fn prepare(desc: *const c_void) -> Option<PcStream> {
     prepare_with(desc, trace_on(), remap_on())
 }
@@ -571,5 +600,21 @@ mod tests {
         let pc = prepared(&console, false, true).expect("rewritten");
         assert_eq!(types_of(&walk_pc(&pc)), vec![ROOT_SIGNATURE, PC_MS, PS, BLEND, RASTERIZER, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT]);
         assert!(prepared(&stream(PC_MS, &ms, &ps), true, true).is_none(), "a PC stream is passed as it is");
+    }
+
+    /// The console numbering is on unless `XCL_CONSOLE_STREAM_TYPES=0`; another value is an error.
+    #[test]
+    fn the_console_numbering_is_on_unless_it_is_0() {
+        assert_eq!(parse_remap(None), Ok(true), "on by default");
+        assert_eq!(parse_remap(Some("1")), Ok(true));
+        assert_eq!(parse_remap(Some("0")), Ok(false));
+        for wrong in ["", "2", "yes", " 0", "off"] {
+            let e = parse_remap(Some(wrong)).expect_err(wrong);
+            assert!(e.contains(CONSOLE_STREAM_TYPES_VAR), "{e}");
+        }
+        let (ms, ps) = (container(KIND_MS, NGG_MS), container(KIND_PS, PS_PS));
+        let console = stream(CONSOLE_MS, &ms, &ps);
+        assert!(prepared(&console, false, parse_remap(None).unwrap()).is_some(), "unset: rewritten");
+        assert!(prepared(&console, false, parse_remap(Some("0")).unwrap()).is_none(), "0: passed as it is");
     }
 }

@@ -30,6 +30,8 @@ struct Pending {
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
+    /// when the build reached the driver's compiler (`driver_build_starts`), None: not yet
+    driver_since: Mutex<Option<std::time::Instant>>,
 }
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
@@ -278,6 +280,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         orphan: Default::default(),
         late: Default::default(),
         demand: Default::default(),
+        driver_since: Mutex::new(None),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -638,29 +641,109 @@ mod frame_budget_tests {
         FrameBudget::new(MS * limit_ms, MS * window_ms, kinds, now)
     }
 
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.to_string())
+    }
+
+    fn parse(vars: &[(&str, &str)]) -> Result<Option<FrameBudget>, String> {
+        FrameBudget::parse(env(vars), Instant::now())
+    }
+
+    fn parse_err(vars: &[(&str, &str)]) -> String {
+        match parse(vars) {
+            Err(e) => e,
+            Ok(_) => panic!("{vars:?} is not an error"),
+        }
+    }
+
+    const COMPUTE_VARS: [(&str, &str); 2] = [(FRAME_WAIT_COMPUTE_MS_VAR, "12000"), (COMPUTE_WAIT_TOTAL_MS_VAR, "120000")];
+
+    fn joined(parts: &[&[(&'static str, &'static str)]]) -> Vec<(&'static str, &'static str)> {
+        parts.concat()
+    }
+
     #[test]
     fn the_frame_budget_is_off_unless_its_milliseconds_are_set() {
-        let now = Instant::now();
-        assert!(FrameBudget::parse(None, None, None, now).unwrap().is_none());
-        assert!(FrameBudget::parse(Some("0"), None, None, now).unwrap().is_none());
-        assert!(FrameBudget::parse(Some(" "), Some("1000"), Some("all"), now).unwrap().is_none());
+        assert!(parse(&[]).unwrap().is_none());
+        assert!(parse(&[(FRAME_WAIT_MS_VAR, "0")]).unwrap().is_none());
+        assert!(parse(&[(FRAME_WAIT_MS_VAR, " "), (FRAME_WAIT_WINDOW_MS_VAR, "1000"), (FRAME_WAIT_KINDS_VAR, "all")]).unwrap().is_none());
     }
 
     #[test]
     fn a_frame_budget_without_its_window_or_kinds_is_an_error() {
-        let now = Instant::now();
-        let missing_window = FrameBudget::parse(Some("200"), None, Some("compute"), now).err().unwrap();
+        let ms = (FRAME_WAIT_MS_VAR, "200");
+        let missing_window = parse_err(&[ms, (FRAME_WAIT_KINDS_VAR, "graphics")]);
         assert!(missing_window.contains(FRAME_WAIT_WINDOW_MS_VAR), "{missing_window}");
-        let zero_window = FrameBudget::parse(Some("200"), Some("0"), Some("compute"), now).err().unwrap();
+        let zero_window = parse_err(&[ms, (FRAME_WAIT_WINDOW_MS_VAR, "0"), (FRAME_WAIT_KINDS_VAR, "graphics")]);
         assert!(zero_window.contains(FRAME_WAIT_WINDOW_MS_VAR), "{zero_window}");
-        let missing_kinds = FrameBudget::parse(Some("200"), Some("1000"), None, now).err().unwrap();
+        let missing_kinds = parse_err(&[ms, (FRAME_WAIT_WINDOW_MS_VAR, "1000")]);
         assert!(missing_kinds.contains(FRAME_WAIT_KINDS_VAR), "{missing_kinds}");
-        let wrong_kinds = FrameBudget::parse(Some("200"), Some("1000"), Some("pixel"), now).err().unwrap();
+        let wrong_kinds = parse_err(&[ms, (FRAME_WAIT_WINDOW_MS_VAR, "1000"), (FRAME_WAIT_KINDS_VAR, "pixel")]);
         assert!(wrong_kinds.contains(FRAME_WAIT_KINDS_VAR), "{wrong_kinds}");
-        let wrong_ms = FrameBudget::parse(Some("lots"), Some("1000"), Some("all"), now).err().unwrap();
+        let wrong_ms = parse_err(&[(FRAME_WAIT_MS_VAR, "lots"), (FRAME_WAIT_WINDOW_MS_VAR, "1000"), (FRAME_WAIT_KINDS_VAR, "all")]);
         assert!(wrong_ms.contains(FRAME_WAIT_MS_VAR), "{wrong_ms}");
-        let f = FrameBudget::parse(Some("200"), Some("1000"), Some(" Graphics "), now).unwrap().unwrap();
-        assert_eq!((f.limit, f.window, f.kinds), (MS * 200, MS * 1000, FrameWaitKinds::Graphics));
+        let f = parse(&[ms, (FRAME_WAIT_WINDOW_MS_VAR, "1000"), (FRAME_WAIT_KINDS_VAR, " Graphics ")]).unwrap().unwrap();
+        assert_eq!((f.limit, f.window, f.kinds, f.compute, f.cutoff), (MS * 200, MS * 1000, FrameWaitKinds::Graphics, None, DriverCutoff::default()));
+    }
+
+    /// With compute binds covered, both compute variables are required (above 0); without, or
+    /// with the budget off, they are an error, as are the cutoffs.
+    #[test]
+    fn the_compute_budget_and_its_cap_are_required_when_compute_binds_are_covered() {
+        let base = [(FRAME_WAIT_MS_VAR, "200"), (FRAME_WAIT_WINDOW_MS_VAR, "1000")];
+        for kinds in ["compute", "all"] {
+            let kinds = [(FRAME_WAIT_KINDS_VAR, kinds)];
+            let with = |extra: &[(&'static str, &'static str)]| joined(&[&base, &kinds, extra]);
+            let e = parse_err(&with(&[]));
+            assert!(e.contains(FRAME_WAIT_COMPUTE_MS_VAR), "{e}");
+            let e = parse_err(&with(&[COMPUTE_VARS[0]]));
+            assert!(e.contains(COMPUTE_WAIT_TOTAL_MS_VAR), "{e}");
+            let e = parse_err(&with(&[COMPUTE_VARS[1]]));
+            assert!(e.contains(FRAME_WAIT_COMPUTE_MS_VAR), "{e}");
+            for wrong in ["0", "-1", "lots"] {
+                let e = parse_err(&with(&[(FRAME_WAIT_COMPUTE_MS_VAR, wrong), COMPUTE_VARS[1]]));
+                assert!(e.contains(FRAME_WAIT_COMPUTE_MS_VAR), "{e}");
+                let e = parse_err(&with(&[COMPUTE_VARS[0], (COMPUTE_WAIT_TOTAL_MS_VAR, wrong)]));
+                assert!(e.contains(COMPUTE_WAIT_TOTAL_MS_VAR), "{e}");
+            }
+            let f = parse(&with(&COMPUTE_VARS)).unwrap().unwrap();
+            assert_eq!(f.compute, Some(ComputeBudget { frame: MS * 12_000, run_cap: MS * 120_000 }));
+        }
+        let graphics = joined(&[&base, &[(FRAME_WAIT_KINDS_VAR, "graphics")]]);
+        for v in COMPUTE_VARS {
+            let e = parse_err(&joined(&[&graphics, &[v]]));
+            assert!(e.contains(v.0) && e.contains(FRAME_WAIT_KINDS_VAR), "{e}");
+        }
+        for v in [COMPUTE_VARS[0], COMPUTE_VARS[1], (DRIVER_CUTOFF_GRAPHICS_VAR, "3000"), (DRIVER_CUTOFF_COMPUTE_VAR, "10000")] {
+            let e = parse_err(&[v]);
+            assert!(e.contains(v.0) && e.contains(FRAME_WAIT_MS_VAR), "budget off: {e}");
+            let e = parse_err(&[(FRAME_WAIT_MS_VAR, "0"), v]);
+            assert!(e.contains(v.0), "budget 0: {e}");
+        }
+    }
+
+    /// The cutoffs are optional (unset: none), above 0, and only for the kinds the budget covers.
+    #[test]
+    fn the_driver_cutoffs_are_optional() {
+        let all = [(FRAME_WAIT_MS_VAR, "200"), (FRAME_WAIT_WINDOW_MS_VAR, "1000"), (FRAME_WAIT_KINDS_VAR, "all"), COMPUTE_VARS[0], COMPUTE_VARS[1]];
+        assert_eq!(parse(&all).unwrap().unwrap().cutoff, DriverCutoff::default());
+        let f = parse(&joined(&[&all, &[(DRIVER_CUTOFF_GRAPHICS_VAR, "3000"), (DRIVER_CUTOFF_COMPUTE_VAR, "10000")]])).unwrap().unwrap();
+        assert_eq!(f.cutoff, DriverCutoff { graphics: Some(MS * 3_000), compute: Some(MS * 10_000) });
+        assert_eq!((f.cutoff.of(false), f.cutoff.of(true)), (Some(MS * 3_000), Some(MS * 10_000)));
+        let f = parse(&joined(&[&all, &[(DRIVER_CUTOFF_COMPUTE_VAR, "10000")]])).unwrap().unwrap();
+        assert_eq!(f.cutoff, DriverCutoff { graphics: None, compute: Some(MS * 10_000) });
+        for name in [DRIVER_CUTOFF_GRAPHICS_VAR, DRIVER_CUTOFF_COMPUTE_VAR] {
+            for wrong in ["0", "soon"] {
+                let e = parse_err(&joined(&[&all, &[(name, wrong)]]));
+                assert!(e.contains(name), "{e}");
+            }
+        }
+        let graphics = [(FRAME_WAIT_MS_VAR, "200"), (FRAME_WAIT_WINDOW_MS_VAR, "1000"), (FRAME_WAIT_KINDS_VAR, "graphics")];
+        let e = parse_err(&joined(&[&graphics, &[(DRIVER_CUTOFF_COMPUTE_VAR, "10000")]]));
+        assert!(e.contains(DRIVER_CUTOFF_COMPUTE_VAR), "{e}");
+        let compute = [(FRAME_WAIT_MS_VAR, "200"), (FRAME_WAIT_WINDOW_MS_VAR, "1000"), (FRAME_WAIT_KINDS_VAR, "compute"), COMPUTE_VARS[0], COMPUTE_VARS[1]];
+        let e = parse_err(&joined(&[&compute, &[(DRIVER_CUTOFF_GRAPHICS_VAR, "3000")]]));
+        assert!(e.contains(DRIVER_CUTOFF_GRAPHICS_VAR), "{e}");
     }
 
     #[test]
@@ -670,42 +753,235 @@ mod frame_budget_tests {
         assert!(FrameWaitKinds::All.covers(true) && FrameWaitKinds::All.covers(false));
     }
 
+    /// A wait is reserved before it begins: the budget is smaller at once, before the wait ends.
     #[test]
-    fn waits_are_charged_to_the_frame_until_a_present_renews_it() {
+    fn a_wait_is_reserved_before_it_begins() {
         let t0 = Instant::now();
         let f = budget(100, 60_000, FrameWaitKinds::All, t0);
-        let (left, epoch) = f.left(t0);
-        assert_eq!(left, MS * 100);
-        f.charge(epoch, MS * 30);
-        f.charge(epoch, MS * 50);
-        assert_eq!(f.left(t0 + MS).0, MS * 20);
-        f.charge(epoch, MS * 500);
-        assert_eq!(f.left(t0 + MS).0, Duration::ZERO, "spent: nothing is left, not less");
-        f.presented(t0 + MS * 2);
-        let (left, renewed) = f.left(t0 + MS * 3);
-        assert_eq!(left, MS * 100);
-        f.charge(epoch, MS * 40);
-        assert_eq!(f.left(t0 + MS * 3).0, MS * 100, "a wait that began before the present is not charged to the new frame");
-        f.charge(renewed, MS * 40);
-        assert_eq!(f.left(t0 + MS * 3).0, MS * 60);
+        let a = f.reserve(false, Some(MS * 30), t0);
+        assert_eq!(a.grant, MS * 30);
+        assert_eq!(f.left(false, t0), MS * 70, "reserved, not yet waited");
+        let b = f.reserve(false, None, t0);
+        assert_eq!(b.grant, MS * 70, "no more than is left");
+        assert_eq!(f.left(false, t0), Duration::ZERO);
+        let c = f.reserve(false, None, t0);
+        assert!(c.grant.is_zero(), "all of it is reserved: the bind does not wait");
+        f.settle(&c, Duration::ZERO);
+        assert_eq!(f.left(false, t0), Duration::ZERO);
+    }
+
+    /// What a bind reserved and did not wait is given back; a wait longer than its reservation
+    /// (the scheduler's lateness) is charged no more than the reservation.
+    #[test]
+    fn what_a_wait_did_not_use_is_given_back() {
+        let t0 = Instant::now();
+        let f = budget(100, 60_000, FrameWaitKinds::All, t0);
+        let r = f.reserve(true, None, t0);
+        assert_eq!(r.grant, MS * 100);
+        f.settle(&r, MS * 30);
+        assert_eq!(f.left(true, t0), MS * 70);
+        let r = f.reserve(true, None, t0);
+        f.settle(&r, MS * 500);
+        assert_eq!(f.left(true, t0), Duration::ZERO, "spent: nothing is left, not less");
+        f.settle(&r, Duration::ZERO);
+        assert_eq!(f.left(true, t0), Duration::ZERO, "a reservation is given back once");
+    }
+
+    /// A wait going on when the budget is new keeps what is left of its reservation in the new
+    /// frame, so the frames' waits in all stay within the budget; what it waited before the
+    /// renewal is not charged to the new frame.
+    #[test]
+    fn a_wait_going_on_keeps_what_is_left_of_its_reservation_in_the_new_frame() {
+        let t0 = Instant::now();
+        let f = budget(100, 60_000, FrameWaitKinds::All, t0);
+        let r = f.reserve(false, None, t0);
+        f.presented(t0 + MS * 40);
+        assert_eq!(f.left(false, t0 + MS * 40), MS * 40, "60 ms of the wait may still come in this frame");
+        f.settle(&r, MS * 50);
+        assert_eq!(f.left(false, t0 + MS * 50), MS * 90, "10 ms of the wait were in the new frame");
+        let r = f.reserve(false, None, t0 + MS * 50);
+        assert_eq!(r.grant, MS * 90);
+        f.presented(t0 + MS * 200);
+        assert_eq!(f.left(false, t0 + MS * 200), MS * 100, "a reservation past its end holds nothing");
+        f.settle(&r, MS * 90);
+        assert_eq!(f.left(false, t0 + MS * 200), MS * 100);
     }
 
     #[test]
     fn the_budget_is_renewed_when_its_window_passes_without_a_present() {
         let t0 = Instant::now();
         let f = budget(100, 1_000, FrameWaitKinds::Compute, t0);
-        let (_, epoch) = f.left(t0);
-        f.charge(epoch, MS * 100);
-        assert_eq!(f.left(t0 + MS * 999).0, Duration::ZERO);
-        assert_eq!(f.left(t0 + MS * 1_000).0, MS * 100, "the window passed");
-        let (_, epoch) = f.left(t0 + MS * 1_000);
-        f.charge(epoch, MS * 100);
-        assert_eq!(f.left(t0 + MS * 1_500).0, Duration::ZERO, "a new window starts at the renewal");
+        let r = f.reserve(true, None, t0);
+        f.settle(&r, MS * 100);
+        assert_eq!(f.left(true, t0 + MS * 999), Duration::ZERO);
+        assert_eq!(f.left(true, t0 + MS * 1_000), MS * 100, "the window passed");
+        let r = f.reserve(true, None, t0 + MS * 1_000);
+        f.settle(&r, MS * 100);
+        assert_eq!(f.left(true, t0 + MS * 1_500), Duration::ZERO, "a new window starts at the renewal");
         f.presented(t0 + MS * 1_800);
-        let (_, epoch) = f.left(t0 + MS * 1_800);
-        f.charge(epoch, MS * 100);
-        assert_eq!(f.left(t0 + MS * 2_700).0, Duration::ZERO, "a present starts a new window too");
-        assert_eq!(f.left(t0 + MS * 2_800).0, MS * 100);
+        let r = f.reserve(true, None, t0 + MS * 1_800);
+        f.settle(&r, MS * 100);
+        assert_eq!(f.left(true, t0 + MS * 2_700), Duration::ZERO, "a present starts a new window too");
+        assert_eq!(f.left(true, t0 + MS * 2_800), MS * 100);
+    }
+
+    fn with_compute(limit_ms: u32, compute_ms: u32, cap_ms: u32, now: Instant) -> FrameBudget {
+        let mut f = budget(limit_ms, 60_000, FrameWaitKinds::All, now);
+        f.compute = Some(ComputeBudget { frame: MS * compute_ms, run_cap: MS * cap_ms });
+        f
+    }
+
+    /// Compute binds wait from their own budget, graphics binds from `XCL_PSO_FRAME_WAIT_MS`; a
+    /// spent compute frame budget skips (it does not borrow the other); once the per-run cap is
+    /// spent compute binds wait within `XCL_PSO_FRAME_WAIT_MS`.
+    #[test]
+    fn compute_binds_have_their_own_budget_until_its_run_cap_is_spent() {
+        let t0 = Instant::now();
+        let f = with_compute(100, 300, 500, t0);
+        assert_eq!((f.left(true, t0), f.left(false, t0)), (MS * 300, MS * 100));
+        let c = f.reserve(true, None, t0);
+        assert_eq!((c.pool, c.grant), (Pool::Compute, MS * 300));
+        assert_eq!(f.left(false, t0), MS * 100, "graphics keeps its budget");
+        assert!(f.reserve(true, None, t0).grant.is_zero(), "the compute frame budget is spent: skip");
+        f.settle(&c, MS * 300);
+        assert_eq!(f.run_compute_spent(), MS * 300);
+        f.presented(t0 + MS);
+        let c = f.reserve(true, None, t0 + MS);
+        assert_eq!((c.pool, c.grant), (Pool::Compute, MS * 200), "no more than is left of the run cap");
+        f.settle(&c, MS * 50);
+        assert_eq!(f.run_compute_spent(), MS * 350, "the unused part goes back to the cap too");
+        let c = f.reserve(true, None, t0 + MS);
+        assert_eq!(c.grant, MS * 150);
+        f.settle(&c, MS * 150);
+        assert_eq!(f.run_compute_spent(), MS * 500);
+        let c = f.reserve(true, None, t0 + MS);
+        assert_eq!((c.pool, c.grant), (Pool::Frame, MS * 100), "the cap is spent: the frame budget");
+        assert!(f.reserve(false, None, t0 + MS).grant.is_zero(), "shared with graphics now");
+        f.settle(&c, MS * 10);
+        assert_eq!(f.left(false, t0 + MS), MS * 90);
+        assert_eq!(f.run_compute_spent(), MS * 500);
+    }
+
+    /// Reservations on many threads at once never come to more than the budget.
+    #[test]
+    fn reservations_on_many_threads_never_exceed_the_budget() {
+        let t0 = Instant::now();
+        let f = Arc::new(with_compute(100, 250, 10_000, t0));
+        let granted: Vec<(bool, Duration)> = (0..16)
+            .map(|k| {
+                let f = f.clone();
+                std::thread::spawn(move || {
+                    let compute = k % 2 == 0;
+                    (compute, f.reserve(compute, Some(MS * 40), t0).grant)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        let sum = |c: bool| granted.iter().filter(|g| g.0 == c).map(|g| g.1).sum::<Duration>();
+        assert_eq!(sum(false), MS * 100, "graphics: exactly the budget, in all");
+        assert_eq!(sum(true), MS * 250, "compute: exactly its own budget, in all");
+    }
+
+    /// Binds on several threads at once, each waiting for a pipeline that is not built in
+    /// time, wait no more than the budget in all.
+    #[test]
+    fn parallel_waits_never_exceed_the_budget() {
+        const THREADS: usize = 6;
+        const LIMIT_MS: u32 = 150;
+        const SLACK_PER_THREAD_MS: u32 = 25;
+        let f: &'static FrameBudget = Box::leak(Box::new(budget(LIMIT_MS, 60_000, FrameWaitKinds::Compute, Instant::now())));
+        let standins: Vec<usize> = (0..THREADS).map(|k| 0x7E57_F100 + k).collect();
+        let mut gos = Vec::new();
+        for &s in &standins {
+            let (go, finish) = mpsc::channel::<()>();
+            gos.push(go);
+            submit(s, true, Box::new(move || {
+                let _ = finish.recv_timeout(Duration::from_secs(10));
+                0x6666
+            }));
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let waited: Duration = standins
+            .iter()
+            .map(|&s| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let t = Instant::now();
+                    assert_eq!(resolve_wait_in(s, None, Some(f)), (s, true));
+                    t.elapsed()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .sum();
+        assert!(waited <= MS * (LIMIT_MS + SLACK_PER_THREAD_MS * THREADS as u32), "{THREADS} binds waited {waited:?} in all");
+        assert_eq!(f.left(true, Instant::now()), Duration::ZERO, "the budget was waited out");
+        for go in gos {
+            let _ = go.send(());
+        }
+        for &s in &standins {
+            wait_until_built(s);
+            let _ = released(s);
+        }
+    }
+
+    /// A bind does not wait for a pipeline the driver has been building longer than the cutoff
+    /// (and spends no budget on it); for one the driver started on just now it waits no longer
+    /// than to the cutoff; a cutoff of the other kind does not bound it.
+    #[test]
+    fn a_pipeline_past_the_driver_cutoff_is_not_waited_for() {
+        let (old, fresh, graphics) = (0x7E57_F201usize, 0x7E57_F202usize, 0x7E57_F203usize);
+        let mut gos = Vec::new();
+        let mut in_driver = Vec::new();
+        for (s, compute) in [(old, true), (fresh, true), (graphics, false)] {
+            let (go, finish) = mpsc::channel::<()>();
+            let (started, driver) = mpsc::channel::<()>();
+            gos.push(go);
+            in_driver.push(driver);
+            submit(s, compute, Box::new(move || {
+                driver_build_starts();
+                let _ = started.send(());
+                let _ = finish.recv_timeout(Duration::from_secs(10));
+                0x6767
+            }));
+        }
+        for d in &in_driver {
+            d.recv_timeout(Duration::from_secs(10)).expect("in the driver");
+        }
+        let mut f = budget(5_000, 60_000, FrameWaitKinds::All, Instant::now());
+        f.cutoff = DriverCutoff { graphics: Some(MS * 400), compute: Some(MS * 300) };
+        std::thread::sleep(MS * 120);
+        let mut f_old = budget(5_000, 60_000, FrameWaitKinds::All, Instant::now());
+        f_old.cutoff = DriverCutoff { graphics: None, compute: Some(MS * 100) };
+        let skips = FRAME_STATS.cutoff_compute.load(Ordering::Relaxed);
+        let t = Instant::now();
+        assert_eq!(resolve_wait_in(old, None, Some(&f_old)), (old, true));
+        assert!(t.elapsed() < MS * 50, "not waited for ({:?})", t.elapsed());
+        assert!(FRAME_STATS.cutoff_compute.load(Ordering::Relaxed) > skips, "counted");
+        assert_eq!(f_old.left(true, Instant::now()), MS * 5_000, "no budget spent");
+        let t = Instant::now();
+        assert_eq!(resolve_wait_in(fresh, None, Some(&f)), (fresh, true));
+        let waited = t.elapsed();
+        assert!(waited < MS * 1_000, "waited only to the cutoff ({waited:?})");
+        assert!(!f.left(true, Instant::now()).is_zero());
+        assert_eq!(resolve_wait_in(fresh, None, Some(&f)), (fresh, true), "past the cutoff now");
+        let mut graphics_only = budget(150, 60_000, FrameWaitKinds::All, Instant::now());
+        graphics_only.cutoff = DriverCutoff { graphics: None, compute: Some(MS * 1) };
+        let t = Instant::now();
+        assert_eq!(resolve_wait_in(graphics, None, Some(&graphics_only)), (graphics, true));
+        assert!(t.elapsed() >= MS * 140, "the compute cutoff does not bound a graphics bind ({:?})", t.elapsed());
+        for go in gos {
+            let _ = go.send(());
+        }
+        for s in [old, fresh, graphics] {
+            wait_until_built(s);
+            assert_eq!(resolve_wait_in(s, None, Some(&f)), (0x6767, false), "built: the real pipeline");
+            let _ = released(s);
+        }
     }
 
     fn wait_until_built(standin: usize) {
@@ -767,7 +1043,7 @@ mod frame_budget_tests {
         }));
         let f = budget(5_000, 60_000, FrameWaitKinds::All, Instant::now());
         assert_eq!(resolve_wait_in(standin, None, Some(&f)), (0x6363, false));
-        assert!(f.left(Instant::now()).0 < MS * 5_000, "the wait was charged");
+        assert!(f.left(true, Instant::now()) < MS * 5_000, "the wait was charged");
         let _ = released(standin);
     }
 
@@ -781,7 +1057,7 @@ mod frame_budget_tests {
         }));
         let f = budget(10, 60_000, FrameWaitKinds::Graphics, Instant::now());
         assert_eq!(resolve_wait_in(standin, None, Some(&f)), (0x6464, false));
-        assert_eq!(f.left(Instant::now()).0, MS * 10, "nothing charged");
+        assert_eq!(f.left(false, Instant::now()), MS * 10, "nothing charged");
         let _ = released(standin);
     }
 
@@ -992,21 +1268,94 @@ impl FrameWaitKinds {
 /// new: during the stall nothing is presented, and without that the binds would never wait
 /// again (or never be bounded).
 ///
-/// Waits are charged after they end, so binds on several threads at once may wait more than the
-/// budget in all (each waits at most what was left when it began).
+/// A bind reserves its wait before it waits, from a budget all threads share, waits at most
+/// what it reserved and gives back what it did not use (`reserve`, `settle`): binds on several
+/// threads at once never wait more than the budget in all. (Charged after they ended, as
+/// before, 219 waits of one run came to 102 s.) A wait still going on when the budget is new
+/// keeps what is left of its reservation in the new frame. The first bind may reserve all that
+/// is left, so binds on other threads meanwhile go on without their pipelines.
+///
+/// Compute binds have a budget of their own (`compute`): a dispatch of a one-time compute pass
+/// that is skipped never comes back (in another fork's run, 130 of them lost walls, floors and
+/// faces). It lasts until the per-run cap is spent; compute binds then wait within `limit`.
+///
+/// No bind waits for a pipeline the driver has been building for longer than `cutoff` (unset:
+/// no cutoff), nor past that point.
 pub struct FrameBudget {
     limit: std::time::Duration,
     window: std::time::Duration,
     kinds: FrameWaitKinds,
+    compute: Option<ComputeBudget>,
+    cutoff: DriverCutoff,
     spend: Mutex<FrameSpend>,
+}
+
+/// The compute binds' own budget (`XCL_PSO_FRAME_WAIT_COMPUTE_MS`, `XCL_PSO_COMPUTE_WAIT_TOTAL_MS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ComputeBudget {
+    /// per frame
+    frame: std::time::Duration,
+    /// in all over the run
+    run_cap: std::time::Duration,
+}
+
+/// How long the driver may have been building a pipeline for a bind still to wait for it
+/// (`XCL_PSO_WAIT_DRIVER_CUTOFF_MS_GRAPHICS` / `_COMPUTE`; None: no cutoff).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DriverCutoff {
+    graphics: Option<std::time::Duration>,
+    compute: Option<std::time::Duration>,
+}
+
+impl DriverCutoff {
+    fn of(self, compute: bool) -> Option<std::time::Duration> {
+        if compute { self.compute } else { self.graphics }
+    }
+
+    fn any(self) -> bool {
+        self.graphics.is_some() || self.compute.is_some()
+    }
+}
+
+/// Which budget a wait is reserved from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pool {
+    /// `limit`: graphics binds, and compute binds without a budget of their own or once its cap is spent
+    Frame,
+    /// the compute binds' own budget, and its per-run cap
+    Compute,
 }
 
 struct FrameSpend {
     /// when the budget was last new
     since: std::time::Instant,
-    /// bumped at each renewal: a wait that began before it is not charged to the new frame
-    epoch: u64,
+    /// of `limit` this frame: waits that ended and what waits going on still hold
     spent: std::time::Duration,
+    /// of the compute budget's `frame`, the same way
+    compute_spent: std::time::Duration,
+    /// of the compute budget's `run_cap`: waits that ended and what waits going on reserved
+    run_compute_spent: std::time::Duration,
+    /// the last reservation's id
+    last: u64,
+    /// the waits going on, by reservation id
+    reserved: HashMap<u64, Outstanding>,
+}
+
+/// A wait going on.
+struct Outstanding {
+    pool: Pool,
+    start: std::time::Instant,
+    grant: std::time::Duration,
+    /// of it, charged to the frame now (all of it until the budget is new, then what was left)
+    charged: std::time::Duration,
+}
+
+/// A bind's reserved wait (`reserve`; to be given back with `settle`). A zero `grant` holds nothing.
+#[derive(Debug)]
+struct Reservation {
+    id: u64,
+    pool: Pool,
+    grant: std::time::Duration,
 }
 
 /// Why the frame budget was last new.
@@ -1019,61 +1368,174 @@ enum Renewal {
 const FRAME_WAIT_MS_VAR: &str = "XCL_PSO_FRAME_WAIT_MS";
 const FRAME_WAIT_WINDOW_MS_VAR: &str = "XCL_PSO_FRAME_WAIT_WINDOW_MS";
 const FRAME_WAIT_KINDS_VAR: &str = "XCL_PSO_FRAME_WAIT_KINDS";
+const FRAME_WAIT_COMPUTE_MS_VAR: &str = "XCL_PSO_FRAME_WAIT_COMPUTE_MS";
+const COMPUTE_WAIT_TOTAL_MS_VAR: &str = "XCL_PSO_COMPUTE_WAIT_TOTAL_MS";
+const DRIVER_CUTOFF_GRAPHICS_VAR: &str = "XCL_PSO_WAIT_DRIVER_CUTOFF_MS_GRAPHICS";
+const DRIVER_CUTOFF_COMPUTE_VAR: &str = "XCL_PSO_WAIT_DRIVER_CUTOFF_MS_COMPUTE";
+
+/// The variables that act only with the frame budget on.
+const FRAME_BUDGET_ONLY_VARS: [&str; 4] = [FRAME_WAIT_COMPUTE_MS_VAR, COMPUTE_WAIT_TOTAL_MS_VAR, DRIVER_CUTOFF_GRAPHICS_VAR, DRIVER_CUTOFF_COMPUTE_VAR];
+
+/// A variable's value in whole milliseconds above 0.
+fn positive_ms(name: &str, value: &str) -> Result<std::time::Duration, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|&ms| ms > 0)
+        .map(std::time::Duration::from_millis)
+        .ok_or_else(|| format!("{name}={value:?} must be a whole number of milliseconds above 0"))
+}
 
 impl FrameBudget {
-    /// The budget the three variables' values describe (None: `XCL_PSO_FRAME_WAIT_MS` unset or 0).
-    fn parse(ms: Option<&str>, window_ms: Option<&str>, kinds: Option<&str>, now: std::time::Instant) -> Result<Option<FrameBudget>, String> {
-        let Some(ms) = ms.map(str::trim).filter(|v| !v.is_empty()) else { return Ok(None) };
+    /// The budget the variables' values describe (`var`: a variable's value, None: unset; None:
+    /// `XCL_PSO_FRAME_WAIT_MS` unset or 0).
+    fn parse(var: impl Fn(&str) -> Option<String>, now: std::time::Instant) -> Result<Option<FrameBudget>, String> {
+        let get = |name: &str| var(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let off = || match FRAME_BUDGET_ONLY_VARS.iter().find(|name| get(name).is_some()) {
+            Some(name) => Err(format!("{name} is set, but it acts only with the frame wait budget, and {FRAME_WAIT_MS_VAR} is unset or 0")),
+            None => Ok(None),
+        };
+        let Some(ms) = get(FRAME_WAIT_MS_VAR) else { return off() };
         let ms: u64 = ms.parse().map_err(|_| format!("{FRAME_WAIT_MS_VAR}={ms:?} is not a whole number of milliseconds"))?;
         if ms == 0 {
-            return Ok(None);
+            return off();
         }
-        let window = window_ms
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
+        let window = get(FRAME_WAIT_WINDOW_MS_VAR)
             .ok_or_else(|| format!("{FRAME_WAIT_MS_VAR} is set, so {FRAME_WAIT_WINDOW_MS_VAR} (the wall time in ms after which the budget is new without a present) must be set too"))?;
         let window: u64 = window
             .parse()
             .ok()
             .filter(|&w| w > 0)
             .ok_or_else(|| format!("{FRAME_WAIT_WINDOW_MS_VAR}={window:?} must be a whole number of milliseconds above 0"))?;
-        let kinds = kinds
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("{FRAME_WAIT_MS_VAR} is set, so {FRAME_WAIT_KINDS_VAR} (compute, graphics or all) must be set too"))?;
-        let kinds = FrameWaitKinds::parse(kinds).ok_or_else(|| format!("{FRAME_WAIT_KINDS_VAR}={kinds:?} must be compute, graphics or all"))?;
-        Ok(Some(FrameBudget::new(std::time::Duration::from_millis(ms), std::time::Duration::from_millis(window), kinds, now)))
+        let kinds = get(FRAME_WAIT_KINDS_VAR).ok_or_else(|| format!("{FRAME_WAIT_MS_VAR} is set, so {FRAME_WAIT_KINDS_VAR} (compute, graphics or all) must be set too"))?;
+        let kinds = FrameWaitKinds::parse(&kinds).ok_or_else(|| format!("{FRAME_WAIT_KINDS_VAR}={kinds:?} must be compute, graphics or all"))?;
+        let required = |name: &str, what: &str| match get(name) {
+            Some(v) => positive_ms(name, &v),
+            None => Err(format!("{FRAME_WAIT_MS_VAR} is set and {FRAME_WAIT_KINDS_VAR} covers compute binds, so {name} ({what}) must be set too")),
+        };
+        let compute = if kinds.covers(true) {
+            Some(ComputeBudget {
+                frame: required(FRAME_WAIT_COMPUTE_MS_VAR, "the compute binds' own wait budget per frame, in ms")?,
+                run_cap: required(COMPUTE_WAIT_TOTAL_MS_VAR, "how long compute binds may wait from their own budget over the whole run, in ms")?,
+            })
+        } else {
+            None
+        };
+        let mut cutoff = DriverCutoff::default();
+        for (name, compute_kind, slot) in [(FRAME_WAIT_COMPUTE_MS_VAR, true, None), (COMPUTE_WAIT_TOTAL_MS_VAR, true, None), (DRIVER_CUTOFF_GRAPHICS_VAR, false, Some(false)), (DRIVER_CUTOFF_COMPUTE_VAR, true, Some(true))] {
+            let Some(v) = get(name) else { continue };
+            if !kinds.covers(compute_kind) {
+                return Err(format!("{name} is set, but {FRAME_WAIT_KINDS_VAR}={kinds:?} does not cover {} binds", if compute_kind { "compute" } else { "graphics" }));
+            }
+            match slot {
+                Some(true) => cutoff.compute = Some(positive_ms(name, &v)?),
+                Some(false) => cutoff.graphics = Some(positive_ms(name, &v)?),
+                None => {}
+            }
+        }
+        let mut f = FrameBudget::new(std::time::Duration::from_millis(ms), std::time::Duration::from_millis(window), kinds, now);
+        f.compute = compute;
+        f.cutoff = cutoff;
+        Ok(Some(f))
     }
 
     fn new(limit: std::time::Duration, window: std::time::Duration, kinds: FrameWaitKinds, now: std::time::Instant) -> FrameBudget {
-        FrameBudget { limit, window, kinds, spend: Mutex::new(FrameSpend { since: now, epoch: 0, spent: std::time::Duration::ZERO }) }
+        let spend = FrameSpend {
+            since: now,
+            spent: std::time::Duration::ZERO,
+            compute_spent: std::time::Duration::ZERO,
+            run_compute_spent: std::time::Duration::ZERO,
+            last: 0,
+            reserved: HashMap::new(),
+        };
+        FrameBudget { limit, window, kinds, compute: None, cutoff: DriverCutoff::default(), spend: Mutex::new(spend) }
     }
 
+    /// The budget is new: of the waits going on, only what is left of their reservations is
+    /// charged to the new frame.
     fn renew(s: &mut FrameSpend, now: std::time::Instant, why: Renewal) {
         s.since = now;
-        s.epoch += 1;
         s.spent = std::time::Duration::ZERO;
+        s.compute_spent = std::time::Duration::ZERO;
+        for o in s.reserved.values_mut() {
+            o.charged = o.grant.saturating_sub(now.saturating_duration_since(o.start));
+            match o.pool {
+                Pool::Frame => s.spent += o.charged,
+                Pool::Compute => s.compute_spent += o.charged,
+            }
+        }
         match why {
             Renewal::Present => FRAME_STATS.renewed_by_present.fetch_add(1, Ordering::Relaxed),
             Renewal::Window => FRAME_STATS.renewed_by_window.fetch_add(1, Ordering::Relaxed),
         };
     }
 
-    /// What is left of the budget now, and the epoch to charge a wait to (`charge`).
-    fn left(&self, now: std::time::Instant) -> (std::time::Duration, u64) {
+    /// Renews the budget when its window has passed.
+    fn spend_at(&self, now: std::time::Instant) -> std::sync::MutexGuard<'_, FrameSpend> {
         let mut s = self.spend.lock().unwrap();
         if now.saturating_duration_since(s.since) >= self.window {
             FrameBudget::renew(&mut s, now, Renewal::Window);
         }
-        (self.limit.saturating_sub(s.spent), s.epoch)
+        s
     }
 
-    /// A bind waited `waited` from `epoch` on (not charged once the budget has been renewed since).
-    fn charge(&self, epoch: u64, waited: std::time::Duration) {
-        let mut s = self.spend.lock().unwrap();
-        if s.epoch == epoch {
-            s.spent = s.spent.saturating_add(waited);
+    /// The budget a bind of this kind waits from now, and what is left of it.
+    fn pool_left(&self, s: &FrameSpend, compute: bool) -> (Pool, std::time::Duration) {
+        if let Some(c) = self.compute.filter(|_| compute) {
+            let run_left = c.run_cap.saturating_sub(s.run_compute_spent);
+            if !run_left.is_zero() {
+                return (Pool::Compute, c.frame.saturating_sub(s.compute_spent).min(run_left));
+            }
         }
+        (Pool::Frame, self.limit.saturating_sub(s.spent))
+    }
+
+    /// (tests) What is left now for a bind of this kind.
+    #[cfg(test)]
+    fn left(&self, compute: bool, now: std::time::Instant) -> std::time::Duration {
+        let s = self.spend_at(now);
+        self.pool_left(&s, compute).1
+    }
+
+    /// Reserves a bind's wait before it waits: what is left for its kind, at most `want`.
+    fn reserve(&self, compute: bool, want: Option<std::time::Duration>, now: std::time::Instant) -> Reservation {
+        let mut s = self.spend_at(now);
+        let (pool, left) = self.pool_left(&s, compute);
+        let grant = want.map_or(left, |w| w.min(left));
+        if grant.is_zero() {
+            return Reservation { id: 0, pool, grant };
+        }
+        match pool {
+            Pool::Frame => s.spent += grant,
+            Pool::Compute => {
+                s.compute_spent += grant;
+                s.run_compute_spent += grant;
+            }
+        }
+        s.last += 1;
+        let id = s.last;
+        s.reserved.insert(id, Outstanding { pool, start: now, grant, charged: grant });
+        Reservation { id, pool, grant }
+    }
+
+    /// The bind waited `waited` of its reservation: what it did not use is given back.
+    fn settle(&self, r: &Reservation, waited: std::time::Duration) {
+        let mut s = self.spend.lock().unwrap();
+        let Some(o) = s.reserved.remove(&r.id) else { return };
+        let used = waited.min(o.grant);
+        let in_frame = (o.start + used).saturating_duration_since(o.start.max(s.since));
+        match o.pool {
+            Pool::Frame => s.spent = s.spent.saturating_sub(o.charged) + in_frame,
+            Pool::Compute => {
+                s.compute_spent = s.compute_spent.saturating_sub(o.charged) + in_frame;
+                s.run_compute_spent = s.run_compute_spent.saturating_sub(o.grant - used);
+            }
+        }
+    }
+
+    /// Of the compute budget's per-run cap: reserved or waited so far.
+    fn run_compute_spent(&self) -> std::time::Duration {
+        self.spend.lock().unwrap().run_compute_spent
     }
 
     /// The title presented a frame: the budget is new.
@@ -1087,13 +1549,19 @@ struct FrameStats {
     /// binds that waited for a build (within the budget)
     waits: std::sync::atomic::AtomicU64,
     waited_us: std::sync::atomic::AtomicU64,
-    /// binds that went on with the stand-in: the budget was spent
+    /// binds that went on with the stand-in: the budget was spent (or the driver cutoff passed)
     gave_up_compute: std::sync::atomic::AtomicU64,
     gave_up_graphics: std::sync::atomic::AtomicU64,
     draws_skipped: std::sync::atomic::AtomicU64,
     dispatches_skipped: std::sync::atomic::AtomicU64,
     renewed_by_present: std::sync::atomic::AtomicU64,
     renewed_by_window: std::sync::atomic::AtomicU64,
+    /// of `waits`, `waited_us`: compute binds'
+    compute_waits: std::sync::atomic::AtomicU64,
+    compute_waited_us: std::sync::atomic::AtomicU64,
+    /// binds that did not wait: the driver had been building the pipeline longer than the cutoff
+    cutoff_graphics: std::sync::atomic::AtomicU64,
+    cutoff_compute: std::sync::atomic::AtomicU64,
 }
 
 static FRAME_STATS: FrameStats = FrameStats {
@@ -1105,6 +1573,10 @@ static FRAME_STATS: FrameStats = FrameStats {
     dispatches_skipped: std::sync::atomic::AtomicU64::new(0),
     renewed_by_present: std::sync::atomic::AtomicU64::new(0),
     renewed_by_window: std::sync::atomic::AtomicU64::new(0),
+    compute_waits: std::sync::atomic::AtomicU64::new(0),
+    compute_waited_us: std::sync::atomic::AtomicU64::new(0),
+    cutoff_graphics: std::sync::atomic::AtomicU64::new(0),
+    cutoff_compute: std::sync::atomic::AtomicU64::new(0),
 };
 
 impl FrameStats {
@@ -1120,6 +1592,19 @@ impl FrameStats {
             self.renewed_by_window.load(Ordering::Relaxed),
         ]
     }
+
+    /// (compute waits, their µs, compute binds without their pipeline, dispatches skipped,
+    /// graphics / compute cutoff skips)
+    fn compute_snapshot(&self) -> [u64; 6] {
+        [
+            self.compute_waits.load(Ordering::Relaxed),
+            self.compute_waited_us.load(Ordering::Relaxed),
+            self.gave_up_compute.load(Ordering::Relaxed),
+            self.dispatches_skipped.load(Ordering::Relaxed),
+            self.cutoff_graphics.load(Ordering::Relaxed),
+            self.cutoff_compute.load(Ordering::Relaxed),
+        ]
+    }
 }
 
 const FRAME_STATS_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1128,17 +1613,18 @@ const FRAME_STATS_PERIOD: std::time::Duration = std::time::Duration::from_secs(2
 /// first by `check_frame_budget`, when the D3D12 backend starts.
 fn frame_budget() -> Option<&'static FrameBudget> {
     static F: OnceLock<Option<FrameBudget>> = OnceLock::new();
-    F.get_or_init(|| {
-        let var = |name: &str| std::env::var(name).ok();
-        match FrameBudget::parse(var(FRAME_WAIT_MS_VAR).as_deref(), var(FRAME_WAIT_WINDOW_MS_VAR).as_deref(), var(FRAME_WAIT_KINDS_VAR).as_deref(), std::time::Instant::now()) {
-            Ok(f) => f,
-            Err(e) => {
-                crate::xlog_error!("D3D12.X: {e}");
-                panic!("D3D12.X: {e}");
-            }
+    F.get_or_init(|| match FrameBudget::parse(|name| std::env::var(name).ok(), std::time::Instant::now()) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::xlog_error!("D3D12.X: {e}");
+            panic!("D3D12.X: {e}");
         }
     })
     .as_ref()
+}
+
+fn cutoff_text(c: Option<std::time::Duration>) -> String {
+    c.map_or_else(|| "off".to_string(), |c| format!("{} ms", c.as_millis()))
 }
 
 /// Reads the frame budget's settings (a malformed one ends the process here, not at a bind
@@ -1151,31 +1637,69 @@ pub fn check_frame_budget() {
         f.limit.as_millis(),
         f.window.as_millis()
     );
-    let _ = std::thread::Builder::new().name("xcl-pso-frame-wait".into()).spawn(|| {
+    if let Some(c) = f.compute {
+        crate::xlog_info!(
+            "D3D12.X: experimental compute wait budget: compute binds wait at most {} ms per frame from their own budget ({FRAME_WAIT_COMPUTE_MS_VAR}), {} ms in all over the run ({COMPUTE_WAIT_TOTAL_MS_VAR}); once that is spent they wait within {FRAME_WAIT_MS_VAR}",
+            c.frame.as_millis(),
+            c.run_cap.as_millis()
+        );
+    }
+    if f.cutoff.any() {
+        crate::xlog_info!(
+            "D3D12.X: pipeline wait driver cutoff: a bind does not wait for a pipeline the driver has been building longer than {} (graphics) / {} (compute), and its draw or dispatch is skipped",
+            cutoff_text(f.cutoff.graphics),
+            cutoff_text(f.cutoff.compute)
+        );
+    }
+    let _ = std::thread::Builder::new().name("xcl-pso-frame-wait".into()).spawn(move || {
         let mut last = FRAME_STATS.snapshot();
+        let mut last_compute = (FRAME_STATS.compute_snapshot(), f.run_compute_spent());
         loop {
             std::thread::sleep(FRAME_STATS_PERIOD);
             let now = FRAME_STATS.snapshot();
-            if now == last {
+            if now != last {
+                let d: Vec<u64> = now.iter().zip(last.iter()).map(|(a, b)| a - b).collect();
+                crate::xlog_info!(
+                    "D3D12.X: frame wait budget, last 2 s: {} binds waited {} ms in all; {} compute / {} graphics binds went on without their pipeline; {} draws, {} dispatches skipped; renewed {} times by PresentX, {} by the window (totals: {} waits, {} ms, {} draws, {} dispatches skipped)",
+                    d[0],
+                    d[1] / 1000,
+                    d[2],
+                    d[3],
+                    d[4],
+                    d[5],
+                    d[6],
+                    d[7],
+                    now[0],
+                    now[1] / 1000,
+                    now[4],
+                    now[5]
+                );
+                last = now;
+            }
+            if f.compute.is_none() && !f.cutoff.any() {
                 continue;
             }
-            let d: Vec<u64> = now.iter().zip(last.iter()).map(|(a, b)| a - b).collect();
+            let compute = (FRAME_STATS.compute_snapshot(), f.run_compute_spent());
+            if compute == last_compute {
+                continue;
+            }
+            let (c, l) = (compute.0, last_compute.0);
+            let cap = f.compute.map_or_else(|| "off".to_string(), |b| format!("{} of {} ms used", compute.1.as_millis(), b.run_cap.as_millis()));
             crate::xlog_info!(
-                "D3D12.X: frame wait budget, last 2 s: {} binds waited {} ms in all; {} compute / {} graphics binds went on without their pipeline; {} draws, {} dispatches skipped; renewed {} times by PresentX, {} by the window (totals: {} waits, {} ms, {} draws, {} dispatches skipped)",
-                d[0],
-                d[1] / 1000,
-                d[2],
-                d[3],
-                d[4],
-                d[5],
-                d[6],
-                d[7],
-                now[0],
-                now[1] / 1000,
-                now[4],
-                now[5]
+                "D3D12.X: compute wait budget, last 2 s: {} compute binds waited {} ms in all; {} compute binds went on without their pipeline, {} dispatches skipped; {} graphics / {} compute binds skipped at once past the driver cutoff; per-run compute cap: {cap} (totals: {} compute waits, {} ms, {} compute binds without their pipeline, {} graphics / {} compute cutoff skips)",
+                c[0] - l[0],
+                (c[1] - l[1]) / 1000,
+                c[2] - l[2],
+                c[3] - l[3],
+                c[4] - l[4],
+                c[5] - l[5],
+                c[0],
+                c[1] / 1000,
+                c[2],
+                c[4],
+                c[5]
             );
-            last = now;
+            last_compute = compute;
         }
     });
 }
@@ -1197,10 +1721,22 @@ pub fn note_skipped_dispatch() {
     FRAME_STATS.dispatches_skipped.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The pipeline a worker builds on this thread has reached the driver's compiler
+/// (`driver_compile` in real.rs): the driver cutoff counts from the first time it does.
+pub(super) fn driver_build_starts() {
+    BUILDING.with(|b| {
+        if let Some(p) = b.borrow().as_ref() {
+            p.driver_since.lock().unwrap().get_or_insert_with(std::time::Instant::now);
+        }
+    });
+}
+
 /// `resolve_wait` of a pipeline `frame` covers: the build goes to the workers (never to this
-/// thread: a build here cannot be bounded) and is wanted; the bind waits at most what is left of
-/// the frame's budget (and of `per_pipeline`, `XCL_PSO_WAIT_MS`). True: not built by then – the
-/// stand-in. Only `per_pipeline` running out makes the pipeline `late`; the frame budget does
+/// thread: a build here cannot be bounded) and is wanted; the bind reserves what is left of the
+/// frame's budget for its kind (at most `per_pipeline`, `XCL_PSO_WAIT_MS`, and the time to the
+/// driver cutoff), waits at most that and gives back the rest. True: not built by then – the
+/// stand-in. A pipeline the driver has been building longer than the cutoff is not waited for
+/// at all. Only `per_pipeline` running out makes the pipeline `late`; the frame budget does
 /// not, so the next frame's binds wait for it again.
 fn resolve_within_frame(p: &Arc<Pending>, pso: usize, per_pipeline: Option<std::time::Duration>, frame: &FrameBudget) -> (usize, bool) {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
@@ -1225,24 +1761,48 @@ fn resolve_within_frame(p: &Arc<Pending>, pso: usize, per_pipeline: Option<std::
     if p.late.load(Ordering::Acquire) {
         return gave_up();
     }
-    let (left, epoch) = frame.left(std::time::Instant::now());
-    let (wait, per_pipeline_bounds) = match per_pipeline {
-        Some(b) if b <= left => (b, true),
-        _ => (left, false),
+    let in_driver = p.driver_since.lock().unwrap().map(|t| t.elapsed());
+    let to_cutoff = match (frame.cutoff.of(p.compute), in_driver) {
+        (Some(cutoff), Some(in_driver)) if in_driver >= cutoff => {
+            if p.compute {
+                FRAME_STATS.cutoff_compute.fetch_add(1, Ordering::Relaxed);
+            } else {
+                FRAME_STATS.cutoff_graphics.fetch_add(1, Ordering::Relaxed);
+            }
+            return gave_up();
+        }
+        (Some(cutoff), Some(in_driver)) => Some(cutoff - in_driver),
+        _ => None,
     };
-    if wait.is_zero() {
+    let want = match (per_pipeline, to_cutoff) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let r = frame.reserve(p.compute, want, std::time::Instant::now());
+    if p.compute && frame.compute.is_some() && r.pool == Pool::Frame {
+        static CAP_SPENT: std::sync::Once = std::sync::Once::new();
+        CAP_SPENT.call_once(|| {
+            crate::xlog_info!("D3D12.X: the compute binds' per-run wait cap ({COMPUTE_WAIT_TOTAL_MS_VAR}) is spent: they wait within {FRAME_WAIT_MS_VAR} from now on");
+        });
+    }
+    if r.grant.is_zero() {
         return gave_up();
     }
+    let per_pipeline_bounds = per_pipeline == Some(r.grant);
     let start = std::time::Instant::now();
     let finished = {
         let _held = Held::new();
-        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), wait, |d| !*d).unwrap();
+        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), r.grant, |d| !*d).unwrap();
         *done
     };
     let waited = start.elapsed();
-    frame.charge(epoch, waited);
+    frame.settle(&r, waited);
     FRAME_STATS.waits.fetch_add(1, Ordering::Relaxed);
     FRAME_STATS.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+    if p.compute {
+        FRAME_STATS.compute_waits.fetch_add(1, Ordering::Relaxed);
+        FRAME_STATS.compute_waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+    }
     if finished {
         return (built(p), false);
     }
