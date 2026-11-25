@@ -90,8 +90,8 @@ walk allows permutations within a footprint class. The trace prints the value of
 payload, so a permutation among those (sample mask, strip cut, topology, DS format, node mask,
 flags) shows up on the next run. With 0–22 unchanged, the
 rewritten stream is the pipeline an earlier build made when it translated these containers as
-mesh shaders (the black screen in 38b05b7). If the title renders nothing again with
-`XCL_CONSOLE_STREAM_TYPES=1`, the cause is likely somewhere other than the numbering, for example
+mesh shaders (the black screen in 38b05b7). If the title renders nothing again with the
+console numbering on, the cause is likely somewhere other than the numbering, for example
 the record layout or the mesh-group split of the two-pass path, or what the title expects of these
 minimap pipelines.
 
@@ -108,7 +108,8 @@ minimap pipelines.
   stage (or `pc`), its size and fnv64 (`null` when empty). Topology, RT formats (count and the 8
   formats) and sample desc show their values, as does every 4-byte payload (`=0x…`). Pointer payloads
   show `ptr` or `zero`. Any other payload shows its fnv64. No shader bytes are logged.
-- `XCL_CONSOLE_STREAM_TYPES=1` (off by default): a stream whose type 24 holds a console MS
+- `XCL_CONSOLE_STREAM_TYPES` (on by default; `0` turns it off, `1` is on too, any other value
+  ends the process when the D3D12 backend starts, naming the variable): a stream whose type 24 holds a console MS
   container is rewritten to the PC numbering before any reader sees it. Only the type words change:
   AS and MS payloads are a `D3D12_SHADER_BYTECODE` either way. There are two cases:
   - **console**: the stream reads to the end with the console table (types 0–24). Every type goes
@@ -130,13 +131,22 @@ minimap pipelines.
   D3D12.X: console-numbered pipeline stream, MS <fnv64> (<console|MS only>): types [<title's types>] read as the PC's [<PC types>] (shaders <PC type>:<fnv64> …)
   ```
 
-  Unset, nothing changes: the refusal in `translated_mesh_stream_once` stays.
+  With `XCL_CONSOLE_STREAM_TYPES=0` nothing changes: the refusal in `translated_mesh_stream_once`
+  stays, and the backend logs once:
+
+  ```
+  D3D12.X: XCL_CONSOLE_STREAM_TYPES=0: pipeline streams in the console's subobject numbering are passed as they are
+  ```
+
+  Why it is on by default: the VIctory project has always read console types 23 and 24 as AS and
+  MS, and all of the title's world mesh shaders translate there. The numbering is
+  still inferred, not measured (the table above).
 
 ## What the next run should check
 
-- Set both variables. Do the `[MS in the AS slot]` lines say `PC walk ok to <size>` (the walk ends
+- With `XCL_TRACE_PSO_STREAM=1`: do the `[MS in the AS slot]` lines say `PC walk ok to <size>` (the walk ends
   exactly at `SizeInBytes`)? Their RT / DS formats and topology should be plausible for a minimap
   pass. Which types do they hold, and is any of them 26–28?
 - Is there any line whose PC walk `stops at … on type 23` or on a type ≥ 26?
-- With `XCL_CONSOLE_STREAM_TYPES=1`: are there 40 "console-numbered pipeline stream" lines, two-pass
+- With the console numbering on (the default): are there 40 "console-numbered pipeline stream" lines, two-pass
   "pipeline from the console MS" lines, and does the title still reach its menus?

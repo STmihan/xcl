@@ -3651,6 +3651,8 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         });
         crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
     }
+    // (the pipeline a worker builds has reached the driver: `XCL_PSO_WAIT_DRIVER_CUTOFF_MS_*`)
+    super::pso_async::driver_build_starts();
     let started = std::time::Instant::now();
     let r = build();
     let took = started.elapsed();
@@ -5247,8 +5249,8 @@ unsafe fn put<T>(to: &mut T, from: &[u8]) {
 }
 
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    // XCL_CONSOLE_STREAM_TYPES: a stream in the console's subobject numbering is read and
-    // created as its PC-numbered copy (stream_types.rs); XCL_TRACE_PSO_STREAM logs its layout
+    // XCL_CONSOLE_STREAM_TYPES (on unless it is 0): a stream in the console's subobject numbering
+    // is read and created as its PC-numbered copy (stream_types.rs); XCL_TRACE_PSO_STREAM logs its layout
     let pc_numbered = super::stream_types::prepare(desc);
     let desc = pc_numbered.as_ref().map_or(desc, |s| s.desc());
     super::null::capture_stream_desc(desc as *const u8);
