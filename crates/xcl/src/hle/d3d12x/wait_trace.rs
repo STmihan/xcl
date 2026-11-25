@@ -390,13 +390,16 @@ pub unsafe fn submitted(queue: *mut c_void, titles: &[*mut c_void], mapped: &[*m
         let (w, k) = super::list_x::sync_counts(l);
         (acc.0 + w, acc.1 + k)
     });
+    let (wait_splits, write_splits) = super::list_x::split_counts(mapped);
+    let signal_cuts = super::list_x::signal_cut_count(mapped);
     let (q, ty) = super::list_x::queue_label(queue);
     crate::xlog_info!(
-        "wait-trace: skipped on q{q}/ty{ty} submit #{submit} frame {}: {} draws, {} dispatches in {} lists (Write64 signals {writes}, memory waits {waits} on them): {}",
+        "wait-trace: skipped on q{q}/ty{ty} submit #{submit} frame {}: {} draws, {} dispatches in {} lists as {} PC lists (Write64 signals {writes}, memory waits {waits} on them; split at waits {wait_splits}, after Write64s {write_splits}; cut for in-order signals {signal_cuts}): {}",
         FRAMES.load(Ordering::Relaxed),
         found.draws,
         found.dispatches,
         titles.len(),
+        mapped.len(),
         found.describe()
     );
 }

@@ -77,6 +77,49 @@ fn release_after(ms: Option<&str>) -> Duration {
     ms.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map_or(GPU_WAIT_WATCHDOG_TIMEOUT, Duration::from_millis)
 }
 
+const BRIDGE_SPLIT_VAR: &str = "XCL_BRIDGE_SPLIT";
+/// Split segments a write split leaves free for the waits that may follow it in the recording,
+/// so splitting after writes never takes the split a later wait needs.
+const WAIT_SPLIT_RESERVE: usize = 4;
+
+/// How the Write64 → Wait64 fence bridge keeps the console's in-list order (`XCL_BRIDGE_SPLIT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeSplit {
+    /// `0`: as before – a submitted batch is cut only before a list with an unsatisfied wait,
+    /// and the newer layout's Reset (#139) of a split list resets only its last segment.
+    Legacy,
+    /// unset: the Write64 signals of a list go out right after it when a later list of the
+    /// same batch waits, and a Reset of a split list resets the whole recording.
+    InOrder,
+    /// `1`: `InOrder`, and the recording is also split right after a Write64 to a cell another
+    /// queue waits for, so its signal goes out when the commands before the write are done.
+    InOrderWithWriteSplits,
+}
+
+fn parse_bridge_split(value: Option<&str>) -> Result<BridgeSplit, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(BridgeSplit::InOrder),
+        Some("0") => Ok(BridgeSplit::Legacy),
+        Some("1") => Ok(BridgeSplit::InOrderWithWriteSplits),
+        Some(other) => Err(format!("{BRIDGE_SPLIT_VAR}={other:?} must be unset, 0 or 1")),
+    }
+}
+
+fn bridge_split() -> BridgeSplit {
+    static MODE: OnceLock<BridgeSplit> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match parse_bridge_split(std::env::var(BRIDGE_SPLIT_VAR).ok().as_deref()) {
+            Ok(mode) => mode,
+            Err(e) => {
+                crate::xlog_error!("D3D12.X: {e}");
+                panic!("D3D12.X: {e}");
+            }
+        };
+        crate::xlog_info!("D3D12.X: Write64/Wait64 bridge order: {mode:?} ({BRIDGE_SPLIT_VAR})");
+        mode
+    })
+}
+
 fn wait_timeout() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
     *T.get_or_init(|| {
@@ -605,6 +648,17 @@ struct ListState {
     predication: Option<D3D12_PREDICATION_OP>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
+    /// Why this PC list became a split segment of its recording (None: the recording's first).
+    split_cause: Option<SplitCause>,
+}
+
+/// What closed the segment before a mid-list split segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitCause {
+    /// a recorded `Wait32/64BitValueX` that must not run before the commands recorded ahead of it
+    Wait,
+    /// a `Write64BitValue*` to a cell another queue waits for (`XCL_BRIDGE_SPLIT=1`)
+    Write,
 }
 
 impl ListState {
@@ -821,6 +875,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
+        s.split_cause = None;
     }
 }
 
@@ -1076,6 +1131,9 @@ struct SyncCell {
     armed_waits: Vec<ArmedGpuWait>,
     /// Active GPU `queue.Signal(&fence, v)` calls on this cell not yet confirmed completed on GPU.
     submitted_signals: Vec<SubmittedSignal>,
+    /// Set once a `Wait64BitValueX` on this cell was bridged to a GPU `queue.Wait`: a cell
+    /// another queue waits for, whose writes `XCL_BRIDGE_SPLIT=1` splits after.
+    bridged: bool,
 }
 
 // SAFETY: `ID3D12Fence` is a free-threaded COM object in D3D12.
@@ -1737,8 +1795,13 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
             }
             SignalAction::CpuCycleBreak(waiters) => {
                 let _ = fence.Signal(val);
+                // The last resort once the in-order bridge could not keep the console's order
+                // (an unsplit write-then-wait, a title fence in the loop): every one is a signal
+                // released before the commands ahead of its write are done, so it stays visible.
+                const DETAILED_BREAKS: u64 = 32;
                 static BREAK_WARN: AtomicU64 = AtomicU64::new(0);
-                if once(&BREAK_WARN, 32) {
+                let n = BREAK_WARN.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= DETAILED_BREAKS || n.is_power_of_two() {
                     let sq = queue_id(sig_q);
                     let mut wids: Vec<String> = waiters
                         .into_iter()
@@ -1747,9 +1810,10 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                     wids.sort();
                     wids.dedup();
                     crate::xlog_warn!(
-                        "D3D12.X: Write64 Signal at {va:#x} = {val:#x} on q{sq}/ty{} would close a GPU cycle (waiters=[{}]) – signalled on CPU",
+                        "D3D12.X: Write64 Signal at {va:#x} = {val:#x} on q{sq}/ty{} would close a GPU cycle (waiters=[{}]) – signalled on CPU (cycle break #{n}, bridge order {:?})",
                         q_ty.0,
-                        wids.join(",")
+                        wids.join(","),
+                        bridge_split()
                     );
                 }
             }
@@ -1873,6 +1937,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         };
         let wait_seq = graph.next_seq(q_raw);
         let cell = graph.cells.get_mut(&w.va).unwrap();
+        cell.bridged = true;
         cell.armed_waits.push(ArmedGpuWait {
             val: w.value,
             waiting_queue: q_raw,
@@ -2021,20 +2086,70 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
             })
             .collect()
     };
+    let cut_after = if bridge_split() == BridgeSplit::Legacy {
+        vec![false; lists.len()]
+    } else {
+        let writes: Vec<bool> = per_list.iter().map(|(_, w)| !w.is_empty()).collect();
+        let waiting: Vec<bool> = per_list.iter().map(|(waits, _)| waits.iter().any(|w| !w.is_satisfied())).collect();
+        signal_cuts(&writes, &waiting)
+    };
     let mut start = 0usize;
     for (i, (waits, list_writes)) in per_list.iter().enumerate() {
-        if waits.is_empty() || waits.iter().all(|w| w.is_satisfied()) {
-            continue;
+        if !waits.is_empty() && !waits.iter().all(|w| w.is_satisfied()) {
+            if i > start {
+                submit(&lists[start..i]);
+            }
+            wait_all_on(queue, waits, list_writes);
+            start = i;
         }
-        if i > start {
-            submit(&lists[start..i]);
+        if cut_after[i] {
+            submit(&lists[start..=i]);
+            start = i + 1;
         }
-        wait_all_on(queue, waits, list_writes);
-        start = i;
     }
     if start < lists.len() {
         submit(&lists[start..]);
     }
+}
+
+/// Where a batch is cut after a list so the `Write64BitValue*` signals of that list go out at
+/// its position, before a later list of the batch waits: on the console those writes are
+/// commands in the stream, and a waiting list after them must not hold them back. `writes[i]`:
+/// list `i` recorded Write64 signals; `waiting[i]`: list `i` has a wait not yet satisfied.
+fn signal_cuts(writes: &[bool], waiting: &[bool]) -> Vec<bool> {
+    let last_waiting = waiting.iter().rposition(|&w| w);
+    writes.iter().enumerate().map(|(i, &w)| w && last_waiting.is_some_and(|last| i < last)).collect()
+}
+
+/// How many lists of `lists` (one submitted batch) the bridge cuts after so their Write64
+/// signals keep their position ahead of a later wait – `XCL_WAIT_TRACE`.
+pub(super) unsafe fn signal_cut_count(lists: &[*mut c_void]) -> usize {
+    if bridge_split() == BridgeSplit::Legacy {
+        return 0;
+    }
+    let (writes, waiting): (Vec<bool>, Vec<bool>) = {
+        let g = LISTS.lock().unwrap();
+        lists
+            .iter()
+            .map(|&l| {
+                g.as_ref()
+                    .and_then(|m| m.get(&(l as usize)))
+                    .map_or((false, false), |s| (!s.write64_signals.is_empty(), s.pending_waits.iter().any(|w| !w.is_satisfied())))
+            })
+            .unzip()
+    };
+    signal_cuts(&writes, &waiting).into_iter().filter(|&c| c).count()
+}
+
+/// The split segments among `lists` by what closed the segment before them: (at a memory wait,
+/// after a bridged Write64) – `XCL_WAIT_TRACE`.
+pub(super) fn split_counts(lists: &[*mut c_void]) -> (usize, usize) {
+    let g = LISTS.lock().unwrap();
+    let Some(m) = g.as_ref() else { return (0, 0) };
+    lists.iter().filter_map(|&l| m.get(&(l as usize))?.split_cause).fold((0, 0), |(wait, write), cause| match cause {
+        SplitCause::Wait => (wait + 1, write),
+        SplitCause::Write => (wait, write + 1),
+    })
 }
 
 #[cfg(test)]
@@ -2494,6 +2609,7 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
     }
     note_write64_recorded(this, va, value);
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
+    split_after_bridged_write64(this, va, value);
 }
 
 /// Close the active PC segment before a recorded memory wait and open/reuse its continuation on
@@ -2501,12 +2617,36 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
 /// The queue submits the prefix and signals any recorded Write64 values before waiting on the
 /// continuation. Ordinary work also needs that ordering even when it signals no Write64 fence.
 unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*mut c_void> {
+    let split = try_split(list, SplitCause::Wait, after_write64);
+    if split.is_none() && after_write64 {
+        // The wait now runs before the Write64 recorded ahead of it in this segment (the
+        // deadlock pattern the cycle detector can only break on the CPU): say why.
+        static UNSPLIT: AtomicU64 = AtomicU64::new(0);
+        let n = UNSPLIT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            let why = match super::title_list::wrapper_of(list) {
+                None => "not a title_list segment",
+                Some(w) if !super::title_list::can_split(w) => "segment limit reached",
+                Some(_) => "the split failed",
+            };
+            crate::xlog_warn!("D3D12.X: memory wait after a Write64 in the same segment not split ({why}, #{n}) – it runs ahead of that Write64's signal");
+        }
+    }
+    split
+}
+
+/// Close the active PC segment of `list`'s recording and open its continuation (see
+/// `try_split_for_wait`); `cause` says what follows the cut.
+unsafe fn try_split(list: *mut c_void, cause: SplitCause, after_write64: bool) -> Option<*mut c_void> {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var("XCL_SPLIT_MIDLIST_WAIT").map_or(true, |v| v.trim() != "0")) {
         return None;
     }
     let wrapper = super::title_list::wrapper_of(list)?;
     if (!after_write64 && !super::title_list::has_recorded_work(wrapper)) || !super::title_list::can_split(wrapper) {
+        return None;
+    }
+    if cause == SplitCause::Write && !super::title_list::can_split_reserving(wrapper, WAIT_SPLIT_RESERVE) {
         return None;
     }
     let ty = list_type(list);
@@ -2623,6 +2763,7 @@ unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*
                 pred_in_state: false,
                 predication,
                 bindings: bindings.clone(),
+                split_cause: Some(cause),
                 ..Default::default()
             },
         );
@@ -2682,11 +2823,42 @@ unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*
 
     super::title_list::activate_segment(wrapper, list, next_pc);
     static SPLITS: AtomicU64 = AtomicU64::new(0);
-    let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 4 || (n.is_power_of_two() && n <= 256) {
-        crate::xlog_info!("D3D12.X: split command list (type {}) at a recorded memory wait (#{n})", ty.0);
+    static WRITE_SPLITS: AtomicU64 = AtomicU64::new(0);
+    let (counter, at) = match cause {
+        SplitCause::Wait => (&SPLITS, "at a recorded memory wait"),
+        SplitCause::Write => (&WRITE_SPLITS, "after a Write64 another queue waits for"),
+    };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: split command list (type {}) {at} (#{n})", ty.0);
     }
     Some(next_pc)
+}
+
+/// `XCL_BRIDGE_SPLIT=1`: after a `Write64BitValue*` to a cell another queue waits for (a bridged
+/// cell), end the segment there so the cell's signal goes out as soon as the commands recorded
+/// before the write are done – the position the write has on the console – instead of after
+/// whatever the list records next. A write at the start of a segment needs no cut.
+unsafe fn split_after_bridged_write64(list: *mut c_void, va: u64, value: u64) {
+    split_after_bridged_write64_in(bridge_split(), list, va, value);
+}
+
+unsafe fn split_after_bridged_write64_in(mode: BridgeSplit, list: *mut c_void, va: u64, value: u64) {
+    if mode != BridgeSplit::InOrderWithWriteSplits || value == 0 || !va.is_multiple_of(8) {
+        return;
+    }
+    let bridged = {
+        let g = SYNC_GRAPH.lock().unwrap();
+        g.as_ref().and_then(|gr| gr.cells.get(&va)).is_some_and(|c| c.bridged && !c.non_monotonic)
+    };
+    if !bridged {
+        return;
+    }
+    let Some(wrapper) = super::title_list::wrapper_of(list) else { return };
+    if !super::title_list::has_recorded_work(wrapper) {
+        return;
+    }
+    let _ = try_split(list, SplitCause::Write, true);
 }
 
 /// Record a `Wait32BitValueX` or `Wait64BitValueX` memory wait on `list`.
@@ -2765,6 +2937,7 @@ pub(super) unsafe extern "system" fn write64_top_x(this: *mut c_void, va: u64, v
     }
     note_write64_recorded(this, va, value);
     write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, W);
+    split_after_bridged_write64(this, va, value);
 }
 
 /// command list #90 Write32BitValueBottomOfShaderX(address, value, stage)
@@ -3699,6 +3872,21 @@ type QueryFn = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u
 /// # Safety
 /// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
 pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
+    // The newer layout's Reset (#139) is forwarded by `title_list` to the active PC segment, not
+    // to the wrapper's own #10: on a split recording that reset only the last segment and left
+    // the earlier ones (and the primary) in the wrapper, so every later ExecuteCommandLists ran
+    // those stale closed segments again ahead of the new recording, and their allocators could
+    // never be reset (alloc_pool put a new PC allocator aside at each title reset).
+    if bridge_split() != BridgeSplit::Legacy {
+        if let Some(wrapper) = super::title_list::split_owner(this) {
+            static REDIRECTED: AtomicU64 = AtomicU64::new(0);
+            let n = REDIRECTED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: Reset of a split command list's active segment resets its whole recording ({n} so far)");
+            }
+            return super::title_list::reset_wrapper(wrapper, alloc, pso);
+        }
+    }
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
@@ -3735,6 +3923,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
+        s.split_cause = None;
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::title_textures::list_reset(this as usize);
@@ -6412,6 +6601,393 @@ mod tests {
                 gr.cells.remove(&va_b);
                 gr.cells.remove(&va_c);
             }
+        }
+    }
+
+    #[test]
+    fn bridge_split_mode_parses_unset_zero_and_one_and_rejects_others() {
+        assert_eq!(parse_bridge_split(None), Ok(BridgeSplit::InOrder));
+        assert_eq!(parse_bridge_split(Some("")), Ok(BridgeSplit::InOrder));
+        assert_eq!(parse_bridge_split(Some("0")), Ok(BridgeSplit::Legacy));
+        assert_eq!(parse_bridge_split(Some(" 1 ")), Ok(BridgeSplit::InOrderWithWriteSplits));
+        assert!(parse_bridge_split(Some("yes")).is_err());
+    }
+
+    /// A list's Write64 signals go out at its position when a later list of the batch waits,
+    /// and only then: after the last waiting list nothing waits for them any more.
+    #[test]
+    fn signal_cuts_keep_writes_ahead_of_later_waits() {
+        assert_eq!(signal_cuts(&[true, false, false], &[false, false, true]), vec![true, false, false]);
+        assert_eq!(signal_cuts(&[true, true, true], &[false, true, false]), vec![true, false, false]);
+        assert_eq!(signal_cuts(&[false, true, true, true], &[true, false, true, false]), vec![false, true, false, false]);
+        assert_eq!(signal_cuts(&[true, true], &[false, false]), vec![false, false]);
+    }
+
+    /// `[writer, plain, waiter]` in one batch: the writer's signals must not wait for `plain`
+    /// (the console has them in the stream right after the writer's commands).
+    #[test]
+    fn execute_with_waits_cuts_after_a_writing_list_before_a_later_wait() {
+        let writer = 0x7100_0001usize as *mut c_void;
+        let plain = 0x7100_0002usize as *mut c_void;
+        let waiter = 0x7100_0003usize as *mut c_void;
+        let cell = Box::new(AtomicU32::new(0));
+        let va = &*cell as *const AtomicU32 as u64;
+        unsafe {
+            for l in [writer, plain, waiter] {
+                on_create(l, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            }
+        }
+        {
+            let mut g = LISTS.lock().unwrap();
+            let m = g.as_mut().unwrap();
+            m.get_mut(&(writer as usize)).unwrap().push_write64_signal(0x7100_0000, 7);
+            m.get_mut(&(waiter as usize)).unwrap().push_wait(PendingWait {
+                va,
+                width: 4,
+                comparison: D3D12_COMPARISON_FUNC_EQUAL.0 as u32,
+                value: 7,
+                mask: u32::MAX as u64,
+                after_write64: false,
+            });
+        }
+        let mut batches: Vec<Vec<usize>> = Vec::new();
+        unsafe {
+            execute_with_waits(&[writer, plain, waiter], |chunk| {
+                batches.push(chunk.iter().map(|&p| p as usize).collect());
+                if chunk.contains(&plain) {
+                    cell.store(7, Ordering::Release);
+                }
+            });
+        }
+        let expected = if bridge_split() == BridgeSplit::Legacy {
+            vec![vec![writer as usize, plain as usize], vec![waiter as usize]]
+        } else {
+            vec![vec![writer as usize], vec![plain as usize], vec![waiter as usize]]
+        };
+        assert_eq!(batches, expected);
+        for l in [writer, plain, waiter] {
+            on_release(l as usize);
+        }
+    }
+
+    fn device_or_skip() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() {
+                return dev;
+            }
+            let warp = CreateDXGIFactory1::<IDXGIFactory4>().ok().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>().ok());
+            if let Some(warp) = warp {
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() {
+                    return dev;
+                }
+            }
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            None
+        }
+    }
+
+    /// A title list as the title gets it: a `title_list` wrapper around an adopted PC list.
+    unsafe fn wrapped_list(dev: &ID3D12Device, alloc: &ID3D12CommandAllocator, ty: D3D12_COMMAND_LIST_TYPE) -> (*mut c_void, *mut c_void) {
+        let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, alloc, None).unwrap();
+        let pc = raw.into_raw();
+        real::adopt(pc, real::Kind::CommandList);
+        on_create(pc, alloc.as_raw() as usize, 0, ty);
+        super::super::bind::reset(pc, alloc.as_raw() as usize, 0);
+        (super::super::title_list::wrap(pc), pc)
+    }
+
+    /// The wrapper's active PC segment (where its next command is recorded).
+    unsafe fn active_segment(wrapper: *mut c_void) -> *mut c_void {
+        let mut segs = Vec::new();
+        assert!(super::super::title_list::push_segments(wrapper, &mut segs));
+        *segs.last().unwrap()
+    }
+
+    unsafe fn close_wrapped(wrapper: *mut c_void) {
+        let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrapper as *const *const usize)).add(9));
+        assert_eq!(close_fn(wrapper), 0);
+    }
+
+    unsafe fn release_wrapped(wrapper: *mut c_void) {
+        let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrapper as *const *const usize)).add(2));
+        rel_fn(wrapper);
+    }
+
+    /// Submit the wrapper's segments to `queue` the way `q_execute_command_lists` does; `after`
+    /// sees each chunk once its Write64 signals went out (the GPU's own write of the cell is
+    /// stood in for by the caller: the test records no WriteBufferImmediate).
+    unsafe fn submit_wrapped(queue: &ID3D12CommandQueue, wrapper: *mut c_void, mut after: impl FnMut(&[*mut c_void])) -> Vec<Vec<*mut c_void>> {
+        type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+        let mut segs = Vec::new();
+        assert!(super::super::title_list::push_segments(wrapper, &mut segs));
+        // (a queue another test adopted runs XCL's own ExecuteCommandLists from its vtable,
+        // which would bridge the same waits a second time)
+        let exec: ExecFn = if real::is_adopted(queue.as_raw()) {
+            std::mem::transmute(real::orig_fn(queue.as_raw(), PC_QUEUE_EXECUTE_COMMAND_LISTS))
+        } else {
+            std::mem::transmute(*(*(queue.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS))
+        };
+        let mut chunks = Vec::new();
+        execute_with_waits_on(queue.as_raw(), &segs, |chunk| {
+            exec(queue.as_raw(), chunk.len() as u32, chunk.as_ptr());
+            signal_write64_fences(queue.as_raw(), chunk);
+            after(chunk);
+            chunks.push(chunk.to_vec());
+        });
+        chunks
+    }
+
+    /// The cell at `va`: GPU waits for `value` armed on it by `queue`, and its submitted value.
+    fn cell_state(va: u64, queue: usize, value: u64) -> (usize, u64) {
+        let g = SYNC_GRAPH.lock().unwrap();
+        g.as_ref()
+            .and_then(|gr| gr.cells.get(&va))
+            .map_or((0, 0), |c| (c.armed_waits.iter().filter(|aw| aw.waiting_queue == queue && aw.val == value).count(), c.submitted_max))
+    }
+
+    fn forget_cells(vas: &[u64]) {
+        if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+            for va in vas {
+                gr.cells.remove(va);
+            }
+        }
+    }
+
+    /// `XCL_BRIDGE_SPLIT=1`: a Write64 to a cell another queue waits for ends its segment when
+    /// work was recorded before it, a write to a cell nobody waits for or at a segment's start
+    /// does not, and the other modes never split after a write.
+    #[test]
+    fn write_split_ends_the_segment_after_a_bridged_write64() {
+        let Some(dev) = device_or_skip() else { return };
+        unsafe {
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let (w, p) = wrapped_list(&dev, &alloc, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            let cells: Vec<Box<AtomicU64>> = (0..2).map(|_| Box::new(AtomicU64::new(0))).collect();
+            let [bridged, private] = [0, 1].map(|i| &*cells[i] as *const AtomicU64 as u64);
+            forget_cells(&[bridged, private]);
+            SYNC_GRAPH.lock().unwrap().get_or_insert_with(SyncGraph::default).cells.entry(bridged).or_default().bridged = true;
+            let segments = || {
+                let mut segs = Vec::new();
+                assert!(super::super::title_list::push_segments(w, &mut segs));
+                segs
+            };
+
+            note_write64_recorded(p, bridged, 1);
+            split_after_bridged_write64_in(BridgeSplit::InOrderWithWriteSplits, p, bridged, 1);
+            assert_eq!(segments(), vec![p], "a write at the segment's start needs no cut");
+
+            super::super::title_list::mark_recorded_work(w);
+            note_write64_recorded(p, private, 1);
+            split_after_bridged_write64_in(BridgeSplit::InOrderWithWriteSplits, p, private, 1);
+            assert_eq!(segments(), vec![p], "nobody waits for this cell");
+            for mode in [BridgeSplit::Legacy, BridgeSplit::InOrder] {
+                split_after_bridged_write64_in(mode, p, bridged, 2);
+                assert_eq!(segments(), vec![p], "{mode:?} never splits after a write");
+            }
+
+            note_write64_recorded(p, bridged, 2);
+            split_after_bridged_write64_in(BridgeSplit::InOrderWithWriteSplits, p, bridged, 2);
+            let segs = segments();
+            assert_eq!(segs.len(), 2, "a bridged write after recorded work ends the segment");
+            assert_eq!(segs[0], p);
+            assert_eq!(split_counts(&segs), (0, 1));
+            {
+                let g = LISTS.lock().unwrap();
+                let m = g.as_ref().unwrap();
+                assert!(m.get(&(p as usize)).unwrap().write64_signals.contains(&(bridged, 2)), "the write stays with the segment it closes");
+                assert!(m.get(&(segs[1] as usize)).unwrap().write64_signals.is_empty());
+            }
+            close_wrapped(w);
+            release_wrapped(w);
+            forget_cells(&[bridged, private]);
+        }
+    }
+
+    /// Two queues whose lists each write their own cell and THEN wait for the other's – the
+    /// pattern that deadlocks when each wait is hoisted ahead of its list and each signal goes
+    /// after it (wait → run → signal on both queues):
+    ///   DIRECT  list D: Write64(A, f) → Wait64(B >= f) → Write64(C, f)
+    ///   COMPUTE list K: Write64(B, f) → Wait64(A >= f) → Write64(E, f)
+    /// Both recordings split at their wait, A's signal goes out before D's wait on B is armed,
+    /// both queues finish, and no cell is released on the CPU. Frame 2 resets each recording
+    /// through its active segment (the newer layout's Reset #139) and must record afresh.
+    #[test]
+    fn two_queue_write_then_wait_lists_keep_order_without_cycle() {
+        const FRAMES: u64 = 2;
+        let Some(dev) = device_or_skip() else { return };
+        unsafe {
+            let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+            let q_d: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let q_k: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let a_d: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let a_k: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let done_d: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done_k: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (w_d, p_d) = wrapped_list(&dev, &a_d, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            let (w_k, p_k) = wrapped_list(&dev, &a_k, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+            let cells: Vec<Box<AtomicU64>> = (0..4).map(|_| Box::new(AtomicU64::new(0))).collect();
+            let [va_a, va_b, va_c, va_e] = [0, 1, 2, 3].map(|i| &*cells[i] as *const AtomicU64 as u64);
+            // (another test's cell at a reused heap address must not answer for these)
+            forget_cells(&[va_a, va_b, va_c, va_e]);
+            let store = |va: u64, f: u64| (*(va as *const AtomicU64)).store(f, Ordering::Release);
+
+            for f in 1..=FRAMES {
+                if f > 1 {
+                    a_d.Reset().unwrap();
+                    a_k.Reset().unwrap();
+                    for (w, p, a) in [(w_d, p_d, &a_d), (w_k, p_k, &a_k)] {
+                        let seg = active_segment(w);
+                        assert_ne!(seg, p, "frame {f}: the recording was split");
+                        assert_eq!(reset_x(seg, a.as_raw() as usize, 0), 0);
+                        if bridge_split() != BridgeSplit::Legacy {
+                            let mut segs = Vec::new();
+                            assert!(super::super::title_list::push_segments(w, &mut segs));
+                            assert_eq!(segs, vec![p], "frame {f}: a Reset through the active segment must drop the earlier segments");
+                            assert_eq!(super::super::title_list::wrapper_of(p), Some(w));
+                        }
+                    }
+                }
+                // both lists are recorded (on their threads) before either is submitted
+                note_write64_recorded(active_segment(w_d), va_a, f);
+                wait64_x(active_segment(w_d), va_b, ge, f, 0, 0);
+                note_write64_recorded(active_segment(w_d), va_c, f);
+                close_wrapped(w_d);
+                note_write64_recorded(active_segment(w_k), va_b, f);
+                wait64_x(active_segment(w_k), va_a, ge, f, 0, 0);
+                note_write64_recorded(active_segment(w_k), va_e, f);
+                close_wrapped(w_k);
+
+                let q_d_raw = q_d.as_raw() as usize;
+                let mut a_signalled_before_b_waited = false;
+                let chunks_d = submit_wrapped(&q_d, w_d, |chunk| {
+                    if chunk.contains(&p_d) {
+                        store(va_a, f);
+                        let (b_waits, _) = cell_state(va_b, q_d_raw, f);
+                        let (_, a_sub) = cell_state(va_a, q_d_raw, f);
+                        a_signalled_before_b_waited = a_sub == f && b_waits == 0;
+                    } else {
+                        store(va_c, f);
+                    }
+                });
+                q_d.Signal(&done_d, f).unwrap();
+                let chunks_k = submit_wrapped(&q_k, w_k, |chunk| {
+                    if chunk.contains(&p_k) {
+                        store(va_b, f);
+                    } else {
+                        store(va_e, f);
+                    }
+                });
+                q_k.Signal(&done_k, f).unwrap();
+
+                assert_eq!(chunks_d.len(), 2, "frame {f}: DIRECT runs as [write A] then [wait B, write C]");
+                let mut segs_k = Vec::new();
+                assert!(super::super::title_list::push_segments(w_k, &mut segs_k));
+                assert_eq!(segs_k.len(), 2, "frame {f}: COMPUTE records [write B] then [wait A, write E]");
+                assert!(!chunks_k.is_empty(), "frame {f}: COMPUTE was submitted (A was already written: its wait needs no cut)");
+                assert!(a_signalled_before_b_waited, "frame {f}: A must be signalled before DIRECT waits for B");
+                crate::gpu::fence::wait(&done_d, f, &dev, None, 2000).expect("DIRECT must finish: no cycle");
+                crate::gpu::fence::wait(&done_k, f, &dev, None, 2000).expect("COMPUTE must finish: no cycle");
+                let g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.as_ref().unwrap();
+                for (name, va) in [("A", va_a), ("B", va_b), ("C", va_c), ("E", va_e)] {
+                    let c = gr.cells.get(&va).unwrap();
+                    assert_eq!(c.cpu_signaled_max, 0, "frame {f}: cell {name} released on the CPU (cycle break)");
+                    assert_eq!(c.submitted_max, f, "frame {f}: cell {name} signalled on the GPU");
+                }
+            }
+
+            release_wrapped(w_d);
+            release_wrapped(w_k);
+            forget_cells(&[va_a, va_b, va_c, va_e]);
+        }
+    }
+
+    /// Three queues, one fork-join frame: DIRECT kicks two compute jobs and joins each in turn,
+    ///   DIRECT    : Write64(K1, f) → Wait64(D1 >= f) → Write64(K2, f) → Wait64(D2 >= f)
+    ///   COMPUTE 1 : Wait64(K1 >= f) → Write64(D1, f)
+    ///   COMPUTE 2 : Wait64(K2 >= f) → Write64(D2, f)
+    /// DIRECT is submitted first, so its joins are armed before the compute queues signal (with
+    /// a join hoisted ahead of its kick that is a cycle through all three queues). DIRECT runs as
+    /// three segments with K2 signalled only after its wait for D1 (the write's position), all
+    /// three queues finish and no cell is released on the CPU.
+    #[test]
+    fn three_queue_fork_join_keeps_write_positions_without_cycle() {
+        const FRAME: u64 = 0x676;
+        let Some(dev) = device_or_skip() else { return };
+        unsafe {
+            let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+            let queue = |ty| -> ID3D12CommandQueue { dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap() };
+            let (q_d, q_1, q_2) = (queue(D3D12_COMMAND_LIST_TYPE_DIRECT), queue(D3D12_COMMAND_LIST_TYPE_COMPUTE), queue(D3D12_COMMAND_LIST_TYPE_COMPUTE));
+            let a_d: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let a_1: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let a_2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let done: [ID3D12Fence; 3] = std::array::from_fn(|_| dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap());
+            let (w_d, p_d) = wrapped_list(&dev, &a_d, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            let (w_1, _) = wrapped_list(&dev, &a_1, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            let (w_2, _) = wrapped_list(&dev, &a_2, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+            let cells: Vec<Box<AtomicU64>> = (0..4).map(|_| Box::new(AtomicU64::new(0))).collect();
+            let [k1, d1, k2, d2] = [0, 1, 2, 3].map(|i| &*cells[i] as *const AtomicU64 as u64);
+            // (another test's cell at a reused heap address must not answer for these)
+            forget_cells(&[k1, d1, k2, d2]);
+            let store = |va: u64| (*(va as *const AtomicU64)).store(FRAME, Ordering::Release);
+
+            note_write64_recorded(active_segment(w_d), k1, FRAME);
+            wait64_x(active_segment(w_d), d1, ge, FRAME, 0, 0);
+            let mid = active_segment(w_d);
+            assert_ne!(mid, p_d, "the join of job 1 after its kick splits DIRECT");
+            note_write64_recorded(mid, k2, FRAME);
+            wait64_x(mid, d2, ge, FRAME, 0, 0);
+            close_wrapped(w_d);
+            wait64_x(active_segment(w_1), k1, ge, FRAME, 0, 0);
+            note_write64_recorded(active_segment(w_1), d1, FRAME);
+            close_wrapped(w_1);
+            wait64_x(active_segment(w_2), k2, ge, FRAME, 0, 0);
+            note_write64_recorded(active_segment(w_2), d2, FRAME);
+            close_wrapped(w_2);
+
+            let t0 = Instant::now();
+            let q_d_raw = q_d.as_raw() as usize;
+            let mut k2_signalled_before_d1_waited = false;
+            let mut d1_waited_before_k2_signalled = false;
+            let chunks_d = submit_wrapped(&q_d, w_d, |chunk| {
+                if chunk.contains(&p_d) {
+                    store(k1);
+                    k2_signalled_before_d1_waited |= cell_state(k2, q_d_raw, FRAME).1 == FRAME;
+                } else if chunk.contains(&mid) {
+                    store(k2);
+                    d1_waited_before_k2_signalled = cell_state(d1, q_d_raw, FRAME).0 == 1;
+                }
+            });
+            q_d.Signal(&done[0], 1).unwrap();
+            submit_wrapped(&q_1, w_1, |_| store(d1));
+            q_1.Signal(&done[1], 1).unwrap();
+            submit_wrapped(&q_2, w_2, |_| store(d2));
+            q_2.Signal(&done[2], 1).unwrap();
+            assert!(t0.elapsed() < Duration::from_millis(500), "submits must not wait on the CPU (took {:?})", t0.elapsed());
+
+            assert_eq!(chunks_d.len(), 3, "DIRECT runs as [kick 1] [join 1, kick 2] [join 2]");
+            assert!(!k2_signalled_before_d1_waited, "K2 must not be signalled ahead of DIRECT's wait for D1");
+            assert!(d1_waited_before_k2_signalled, "DIRECT's wait for D1 went to the GPU ahead of the K2 segment");
+            for (i, f) in done.iter().enumerate() {
+                crate::gpu::fence::wait(f, 1, &dev, None, 2000).unwrap_or_else(|e| panic!("queue {i} must finish: no cycle ({e:?})"));
+            }
+            let g = SYNC_GRAPH.lock().unwrap();
+            let gr = g.as_ref().unwrap();
+            for (name, va) in [("K1", k1), ("D1", d1), ("K2", k2), ("D2", d2)] {
+                let c = gr.cells.get(&va).unwrap();
+                assert_eq!(c.cpu_signaled_max, 0, "cell {name} released on the CPU (cycle break)");
+                assert_eq!(c.submitted_max, FRAME, "cell {name} signalled on the GPU");
+            }
+            drop(g);
+            for w in [w_d, w_1, w_2] {
+                release_wrapped(w);
+            }
+            forget_cells(&[k1, d1, k2, d2]);
         }
     }
 
