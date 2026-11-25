@@ -1061,6 +1061,32 @@ mod frame_budget_tests {
         let _ = released(standin);
     }
 
+    /// Setting a compute pipeline on a list (no work runs there) does not wait for it when the
+    /// frame budget covers compute binds, and spends none of it: the stand-in is set. Without
+    /// such a budget it waits until the pipeline is built, as before.
+    #[test]
+    fn setting_a_pipeline_on_a_list_does_not_wait_within_the_frame_budget() {
+        let standin = 0x7E57_F006usize;
+        let (go, finish) = mpsc::channel::<()>();
+        submit(standin, true, Box::new(move || {
+            let _ = finish.recv_timeout(Duration::from_secs(10));
+            0x6868
+        }));
+        let f = budget(5_000, 60_000, FrameWaitKinds::Compute, Instant::now());
+        let t = Instant::now();
+        assert_eq!(resolve_for_bind_in(standin, Some(&f)), standin, "the stand-in");
+        assert!(t.elapsed() < MS * 200, "not waited for ({:?})", t.elapsed());
+        assert_eq!(f.left(true, Instant::now()), MS * 5_000, "nothing spent");
+        let graphics_only = budget(5_000, 60_000, FrameWaitKinds::Graphics, Instant::now());
+        let waiter = std::thread::spawn(move || resolve_for_bind_in(standin, Some(&graphics_only)));
+        std::thread::sleep(MS * 50);
+        assert!(!waiter.is_finished(), "a budget for graphics only: waited for, as before");
+        go.send(()).unwrap();
+        assert_eq!(waiter.join().unwrap(), 0x6868);
+        assert_eq!(resolve_for_bind_in(standin, Some(&f)), 0x6868, "built: the real pipeline");
+        let _ = released(standin);
+    }
+
     /// With `XCL_PSO_WAIT_MS` too, a bind waits the shorter of the two; only that per-pipeline
     /// budget makes the pipeline late (not waited for again).
     #[test]
@@ -1813,9 +1839,22 @@ fn resolve_within_frame(p: &Arc<Pending>, pso: usize, per_pipeline: Option<std::
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.
+///
+/// Its callers set a pipeline on a list and run no work (SetPipelineState, Reset, ClearState, a
+/// list's initial pipeline at creation or after a split or kickoff, a pipeline put back after a
+/// depth-bias stand-in): nothing there can be skipped. With the frame wait budget covering
+/// compute binds (`XCL_PSO_FRAME_WAIT_MS`) a compute pipeline is not waited for either: the
+/// stand-in (or the real pipeline once built) is set without spending the budget, and every
+/// dispatch that runs it – `bind::dispatch`, `bind::execute_indirect`, the console list
+/// replay – resolves the title's pipeline again, waits within the budget or is skipped, and
+/// binds the real one itself. (Waiting here spent the budget twice, once for no work.)
 pub fn resolve_for_bind(pso: usize) -> usize {
+    resolve_for_bind_in(pso, frame_budget())
+}
+
+fn resolve_for_bind_in(pso: usize, frame: Option<&FrameBudget>) -> usize {
     match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
+        Some(p) if p.compute && !frame.is_some_and(|f| f.kinds.covers(true)) => resolve_wait(pso),
         Some(_) => resolve(pso),
         None => pso,
     }

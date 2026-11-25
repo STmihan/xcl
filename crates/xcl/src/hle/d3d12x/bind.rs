@@ -542,7 +542,8 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
+                // (what the bind resolved above: not waited for again, nor charged to the frame budget)
+                let real = resolved;
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
@@ -982,6 +983,20 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     Ok(())
 }
 
+/// The pipeline `bind_abi` sets: the caller's, already resolved (`resolve_wait_checked`) and
+/// translated, of the kind of its draw or dispatch. A stand-in (a pipeline still being built,
+/// or one the frame's wait budget gave up on) is refused, never resolved or waited for here:
+/// its user SGPRs and root signature are not the real pipeline's, and the frame budget's skip
+/// is decided by the caller.
+fn abi_pipeline(pso: usize, gfx: bool) -> Result<usize, String> {
+    let translated = if gfx { super::real::is_translated_graphics(pso) } else { super::real::is_translated_compute(pso) };
+    if translated {
+        Ok(pso)
+    } else {
+        Err(format!("{pso:#x} is not a translated {} pipeline (a stand-in still being built?)", if gfx { "graphics" } else { "compute" }))
+    }
+}
+
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
@@ -997,8 +1012,8 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
+    // the caller resolved it (and waited for it, or skipped the work: `resolve_wait_checked`)
+    let real = abi_pipeline(pso, gfx)?;
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
@@ -1091,6 +1106,39 @@ mod tests {
         pso_async::released(built);
         pso_async::released(failed);
         assert!(!pso_async::is_pending(building));
+    }
+
+    /// The ABI binding of a draw, dispatch or ExecuteIndirect takes the pipeline its caller
+    /// resolved: a stand-in still being built is refused at once (the work is skipped), not
+    /// waited for and not read for its user SGPRs; a translated pipeline is taken as it is.
+    #[test]
+    fn the_abi_binding_refuses_a_stand_in_without_waiting() {
+        let (standin, compute, graphics) = (0x7E57_6011usize, 0x7E57_6012usize, 0x7E57_6013usize);
+        let (go, finish) = std::sync::mpsc::channel::<()>();
+        pso_async::submit(standin, true, Box::new(move || {
+            let _ = finish.recv_timeout(std::time::Duration::from_secs(10));
+            0x1236
+        }));
+        real::register_translated_compute_for_test(compute);
+        real::register_translated_graphics_for_test(graphics);
+        let t = std::time::Instant::now();
+        for gfx in [false, true] {
+            let e = abi_pipeline(standin, gfx).expect_err("a stand-in");
+            assert!(e.contains("stand-in"), "{e}");
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(200), "not waited for ({:?})", t.elapsed());
+        assert!(pso_async::is_pending(standin), "still building");
+        assert_eq!(abi_pipeline(compute, false), Ok(compute));
+        assert_eq!(abi_pipeline(graphics, true), Ok(graphics));
+        assert!(abi_pipeline(compute, true).is_err() && abi_pipeline(graphics, false).is_err(), "of the other kind");
+        let _ = go.send(());
+        let start = std::time::Instant::now();
+        while pso_async::is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        pso_async::released(standin);
+        real::forget_pso_for_test(compute);
+        real::forget_pso_for_test(graphics);
     }
 
     /// A dispatch writes an ExecuteIndirect's group count through another buffer over the same
