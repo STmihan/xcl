@@ -55,16 +55,20 @@ has the newer layout ("device method #133 called").
 
 ## What is known about the console numbering
 
-- **Types 0–22 are the PC's (strong evidence).** In run32 and run36, the 40 refused pipelines
-  ("mesh pipeline with its MS … in the AS slot – refused") all passed `stream_subobjects`
-  first. That walk fails on any type outside the table above and on any payload past the end.
-  So every subobject in those streams has a type the PC knows, and the payload sizes add up. A
-  shifted numbering in 0–22 would break the walk: BLEND (328 bytes) read as SAMPLE_MASK (4 bytes)
-  would put every later type at a wrong offset. No run logged "unknown subobject type"
-  (`known_subobjects`). The title's VS/PS pipelines also come as streams, are read by
-  `stream_pipeline` with this numbering, and draw its menus.
-- **No stream contained type 23.** `stream_subobjects` would have failed on it, and the refusal
-  comes after that call.
+- **Types 0–22: consistent with the PC's, not proven.** In run32 and run36, the 40 refused
+  pipelines ("mesh pipeline with its MS … in the AS slot – refused") all passed
+  `stream_subobjects` first. That walk fails on any type outside the table above and on any
+  payload past the end. So every subobject in those streams has a type the PC table knows, and the
+  payload footprints add up. The walk only checks each subobject's padded footprint, though, and
+  many types share one: 8 bytes (9, 13, 14, 16, 18, 20), 16 (0, 17), 24 (1–6, 12, 19, 24, 25),
+  40 (7, 15), 48 (10, 27, 28), 64 (21, 26). A shift is caught only when a type with its own
+  footprint (BLEND 336, DEPTH_STENCIL 56, VIEW_INSTANCING 32) is in the stream, and which types
+  these streams hold has not been logged. No run logged "unknown subobject type" (`known_subobjects`).
+  Whether the title's VS/PS pipelines come as streams too is not established: `graphics_pso`
+  serves both the plain and the stream path, and its log line does not tell them apart.
+- **No refused stream contained type 23**, and none a type 25 with readable bytecode.
+  `stream_subobjects` would have failed on 23, and the refusal needs no MS. Types 26–28 may be there:
+  the PC table accepts them.
 - **Console MS = 24 (inferred).** The 40 refused pipelines carry a single-stage console mesh
   container (DXIL kind MS, NGG, no amplification program; decoded by an upstream contributor in
   xcl-dev/xcl#1269, raw stream bytes not captured) in type 24, and have no type 25. A PC stream never
@@ -72,17 +76,19 @@ has the newer layout ("device method #133 called").
 - **Console AS = 23 (inferred).** It is the one value the PC leaves out, and it is what the public
   references read for the console. No stream with it has been seen.
 - **Console types from 25 on: unknown.** Whether DEPTH_STENCIL2 / RASTERIZER1 / RASTERIZER2 moved
-  down by one is not known. None of the 40 streams has a type ≥ 25, so their walk says nothing about
-  it. A console stream with one of them is left as it is.
+  down by one is not known.
 
 | console type | read as PC type | how sure |
 |---|---|---|
-| 0–22 | the same | size walk of 40 retail streams |
+| 0–22 | the same | consistent with the footprint walk of 40 retail streams; to be confirmed by the trace |
 | 23 | 24 (AS) | inferred (PC gap, public references) |
 | 24 | 25 (MS) | inferred (MS container in it, no 25) |
-| ≥ 25 | – | unknown; `XCL_TRACE_PSO_STREAM` shows any such stream |
+| ≥ 25 | – | unknown; read as the PC's in an "MS only" remap (below) |
 
-The hypothesis that the whole stream is shifted is not supported so far. With 0–22 unchanged, the
+The hypothesis that the whole stream is shifted is neither supported nor ruled out: the footprint
+walk allows permutations within a footprint class. The trace prints the value of every 4-byte
+payload, so a permutation among those (sample mask, strip cut, topology, DS format, node mask,
+flags) shows up on the next run. With 0–22 unchanged, the
 rewritten stream is the pipeline an earlier build made when it translated these containers as
 mesh shaders (the black screen in 38b05b7). If the title renders nothing again with
 `XCL_CONSOLE_STREAM_TYPES=1`, the cause is likely somewhere other than the numbering, for example
@@ -94,31 +100,43 @@ minimap pipelines.
 - `XCL_TRACE_PSO_STREAM=1`: one line per distinct stream (deduplicated by its text):
 
   ```
-  D3D12.X: PSO stream <size> B [<kind>], PC walk <ok to 0x… | stops at 0x… on type N>, console walk <…>; read as <pc|console>: <off>:<type>(<payload size>) …, …
+  D3D12.X: PSO stream <size> B [<kind>], PC walk <ok to 0x… | stops at 0x… on type N>, console walk <…>; read as <pc|console|MS only>: <off>:<type>(<payload size>) …, …
   ```
 
   `kind` is the PC reading: `MS in the AS slot`, `console mesh`, `PC mesh`, `console graphics`,
   `PC graphics`, `console compute`, `PC compute` or `other`. A shader subobject shows its console
   stage (or `pc`), its size and fnv64 (`null` when empty). Topology, RT formats (count and the 8
-  formats), DS format and sample desc show their values. Pointer payloads show `ptr` or `zero`. Any
-  other payload shows its fnv64. No shader bytes are logged.
-- `XCL_CONSOLE_STREAM_TYPES=1` (off by default): when the stream reads to the end with the console
-  numbering and its type 24 holds a console MS container, its types are rewritten to the PC's (only
-  the type words change: AS and MS payloads are a `D3D12_SHADER_BYTECODE` in both). That copy is
-  what every reader and the driver see. The mesh-only pipeline then takes the existing two-pass
-  path (compute pass, mesh pass, the title's PS). One line per pipeline:
+  formats) and sample desc show their values, as does every 4-byte payload (`=0x…`). Pointer payloads
+  show `ptr` or `zero`. Any other payload shows its fnv64. No shader bytes are logged.
+- `XCL_CONSOLE_STREAM_TYPES=1` (off by default): a stream whose type 24 holds a console MS
+  container is rewritten to the PC numbering before any reader sees it. Only the type words change:
+  AS and MS payloads are a `D3D12_SHADER_BYTECODE` either way. There are two cases:
+  - **console**: the stream reads to the end with the console table (types 0–24). Every type goes
+    through it: 23 → 24, 24 → 25.
+  - **MS only**: the console table stops on a type ≥ 25, the PC table reads the stream to the end,
+    and there is no type 25 at all. Only 24 → 25 is changed; the other types stay as the PC read them.
+
+  A stream with an MS container in 24 that fits neither case (type 25 present, even with null
+  bytecode, or no numbering reads it to the end) is left as it is and logged once:
 
   ```
-  D3D12.X: console-numbered pipeline stream, MS <fnv64>: types [<console types>] read as the PC's [<PC types>] (shaders <type>:<fnv64> …)
+  D3D12.X: pipeline stream MS <fnv64> in type 24 left as it is: <why>; types [<PC reading>]
+  ```
+
+  The rewritten copy is what every reader and the driver see. The mesh-only pipeline then takes the
+  existing two-pass path (compute pass, mesh pass, the title's PS). One line per pipeline:
+
+  ```
+  D3D12.X: console-numbered pipeline stream, MS <fnv64> (<console|MS only>): types [<title's types>] read as the PC's [<PC types>] (shaders <PC type>:<fnv64> …)
   ```
 
   Unset, nothing changes: the refusal in `translated_mesh_stream_once` stays.
 
 ## What the next run should check
 
-- With `XCL_TRACE_PSO_STREAM=1`, do the `[MS in the AS slot]` lines say `PC walk ok to <size>`
-  (the walk ends exactly at `SizeInBytes`)? Their RT / DS formats and topology should be plausible
-  for a minimap pass.
+- Set both variables. Do the `[MS in the AS slot]` lines say `PC walk ok to <size>` (the walk ends
+  exactly at `SizeInBytes`)? Their RT / DS formats and topology should be plausible for a minimap
+  pass. Which types do they hold, and is any of them 26–28?
 - Is there any line whose PC walk `stops at … on type 23` or on a type ≥ 26?
 - With `XCL_CONSOLE_STREAM_TYPES=1`: are there 40 "console-numbered pipeline stream" lines, two-pass
   "pipeline from the console MS" lines, and does the title still reach its menus?

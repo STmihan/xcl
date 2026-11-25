@@ -14,8 +14,8 @@ use std::sync::{Mutex, OnceLock};
 /// The console's mesh shader subobject (the PC's AS).
 const CONSOLE_MS: u32 = 24;
 
-/// Console types read as the PC's: in retail mesh streams read with the PC's payload sizes,
-/// every subobject up to the end was one of these (a shift would break that walk).
+/// Console types read as the PC's: retail mesh streams read to the end with the PC's payload
+/// sizes, which is consistent with this but does not tell apart types of the same size.
 const CONSOLE_SAME_AS_PC: Range<u32> = 0..23;
 
 /// Console type → the PC's, where they differ. Inferred, not measured: the PC leaves 23 out
@@ -83,24 +83,67 @@ pub(super) fn walk_console(buf: &[u8]) -> Walk {
     walk(buf, console_payload)
 }
 
-/// The stream in the console's numbering: it reads to the end with it, and its console MS
-/// subobject holds a mesh shader container (`is_ms`) – in the PC's numbering that is the AS
-/// slot, which no PC stream fills with a mesh shader.
-pub(super) fn console_numbered(buf: &[u8], is_ms: impl Fn(&[u8]) -> bool) -> Option<Walk> {
-    let w = walk_console(buf);
-    if w.stop.is_some() {
-        return None;
+/// The PC's MS
+const PC_MS: u32 = 25;
+
+/// A stream's subobjects with the title's type and the PC's.
+#[derive(Debug, Clone)]
+pub(super) struct Remap {
+    /// "console": read to the end in the console's numbering; "MS only": in the PC's (a type
+    /// from 25 on, which the console table does not know), with only its MS moved from 24 to 25
+    pub reading: &'static str,
+    pub subs: Vec<(Sub, u32)>,
+}
+
+/// What to do with a stream.
+#[derive(Debug, Clone)]
+pub(super) enum Plan {
+    /// no console MS container in type 24
+    Pc,
+    Remap(Remap),
+    /// a console MS container in type 24, but the stream is not taken as the console's (why)
+    Kept(String),
+}
+
+/// A stream whose type 24 holds a mesh shader container (`is_ms`) is in the console's
+/// numbering: in the PC's, 24 is the AS slot, which no PC stream fills with a mesh shader.
+pub(super) fn plan(buf: &[u8], is_ms: impl Fn(&[u8]) -> bool) -> Plan {
+    let ms_in_24 = |w: &Walk| w.subs.iter().find(|s| s.ty == CONSOLE_MS).is_some_and(|s| is_ms(&buf[s.payload.clone()]));
+    let cw = walk_console(buf);
+    if cw.stop.is_none() {
+        if !ms_in_24(&cw) {
+            return Plan::Pc;
+        }
+        let subs = cw.subs.into_iter().map(|s| {
+            let pc = console_to_pc(s.ty).expect("a console-numbered walk has only known types");
+            (s, pc)
+        });
+        return Plan::Remap(Remap { reading: "console", subs: subs.collect() });
     }
-    let ms = w.subs.iter().find(|s| s.ty == CONSOLE_MS)?;
-    is_ms(&buf[ms.payload.clone()]).then_some(w)
+    let pw = walk_pc(buf);
+    if !ms_in_24(&pw) {
+        return Plan::Pc;
+    }
+    if let Some((off, ty)) = pw.stop {
+        return Plan::Kept(format!("neither numbering reads it to the end (PC: type {ty} at {off:#x})"));
+    }
+    if pw.subs.iter().any(|s| s.ty == PC_MS) {
+        return Plan::Kept("it has a type 25 as well".into());
+    }
+    let subs = pw.subs.into_iter().map(|s| {
+        let pc = if s.ty == CONSOLE_MS { PC_MS } else { s.ty };
+        (s, pc)
+    });
+    Plan::Remap(Remap { reading: "MS only", subs: subs.collect() })
 }
 
 /// The stream with its types in the PC's numbering (payloads and offsets unchanged).
-pub(super) fn to_pc(buf: &[u8], w: &Walk) -> Vec<u8> {
+pub(super) fn to_pc(buf: &[u8], r: &Remap) -> Vec<u8> {
     let mut out = buf.to_vec();
-    for s in &w.subs {
-        let pc = console_to_pc(s.ty).expect("a console-numbered walk has only known types");
-        assert_eq!(console_payload(s.ty), pc_payload(pc), "console type {} and PC type {pc} differ in payload layout", s.ty);
+    for (s, pc) in &r.subs {
+        if s.ty != *pc {
+            assert_eq!(super::null::subobject_payload(s.ty).or_else(|| console_payload(s.ty)), pc_payload(*pc), "type {} read as {pc}: the payload layout differs", s.ty);
+        }
         out[s.off..s.off + 4].copy_from_slice(&pc.to_le_bytes());
     }
     out
@@ -152,7 +195,11 @@ impl PcStream {
 /// console's numbering and `XCL_CONSOLE_STREAM_TYPES` is set, the PC-numbered copy to read and
 /// create instead.
 pub(super) unsafe fn prepare(desc: *const c_void) -> Option<PcStream> {
-    if !trace_on() && !remap_on() {
+    prepare_with(desc, trace_on(), remap_on())
+}
+
+unsafe fn prepare_with(desc: *const c_void, trace_streams: bool, remap: bool) -> Option<PcStream> {
+    if !trace_streams && !remap {
         return None;
     }
     if !crate::gpu::shader::readable(desc as usize, 16) {
@@ -163,16 +210,23 @@ pub(super) unsafe fn prepare(desc: *const c_void) -> Option<PcStream> {
         return None;
     }
     let buf = std::slice::from_raw_parts(base as *const u8, size);
-    let console = console_numbered(buf, |p| is_ms_payload(p));
-    if trace_on() {
-        trace(buf, console.as_ref());
+    let plan = plan(buf, |p| is_ms_payload(p));
+    if trace_streams {
+        trace(buf, &plan);
     }
-    if !remap_on() {
+    if !remap {
         return None;
     }
-    let w = console?;
-    let out = to_pc(buf, &w);
-    note_remapped(buf, &w);
+    let r = match plan {
+        Plan::Remap(r) => r,
+        Plan::Kept(why) => {
+            note_kept(buf, &why);
+            return None;
+        }
+        Plan::Pc => return None,
+    };
+    let out = to_pc(buf, &r);
+    note_remapped(buf, &r);
     let desc = Box::new([out.len(), out.as_ptr() as usize]);
     Some(PcStream { _buf: out, desc })
 }
@@ -181,27 +235,46 @@ fn types_of(w: &Walk) -> Vec<u32> {
     w.subs.iter().map(|s| s.ty).collect()
 }
 
-unsafe fn shader_hashes(buf: &[u8], w: &Walk, numbering: fn(u32) -> Option<u32>) -> String {
-    w.subs
+fn is_shader_type(pc: u32) -> bool {
+    (1..=6).contains(&pc) || pc == 24 || pc == PC_MS
+}
+
+unsafe fn shader_hashes(buf: &[u8], r: &Remap) -> String {
+    r.subs
         .iter()
-        .filter(|s| numbering(s.ty).is_some_and(|t| (1..=6).contains(&t) || t == 24 || t == 25))
-        .filter_map(|s| bytecode(&buf[s.payload.clone()]).map(|c| format!("{}:{:016x}", s.ty, crate::gpu::shader::fnv64(c))))
+        .filter(|(_, pc)| is_shader_type(*pc))
+        .filter_map(|(s, pc)| bytecode(&buf[s.payload.clone()]).map(|c| format!("{pc}:{:016x}", crate::gpu::shader::fnv64(c))))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+unsafe fn ms_hash(buf: &[u8]) -> u64 {
+    walk_pc(buf).subs.iter().find(|s| s.ty == CONSOLE_MS).and_then(|s| bytecode(&buf[s.payload.clone()])).map_or(0, crate::gpu::shader::fnv64)
+}
+
+fn first_time(seen: &Mutex<Option<HashSet<u64>>>, key: &str) -> bool {
+    seen.lock().unwrap().get_or_insert_with(HashSet::new).insert(crate::gpu::shader::fnv64(key.as_bytes()))
+}
+
 /// One line per console-numbered pipeline taken in the PC's numbering.
-unsafe fn note_remapped(buf: &[u8], w: &Walk) {
+unsafe fn note_remapped(buf: &[u8], r: &Remap) {
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
-    let console = types_of(w);
-    let pc: Vec<u32> = console.iter().filter_map(|&t| console_to_pc(t)).collect();
-    let ms = w.subs.iter().find(|s| s.ty == CONSOLE_MS).and_then(|s| bytecode(&buf[s.payload.clone()])).map_or(0, crate::gpu::shader::fnv64);
-    let shaders = shader_hashes(buf, w, console_to_pc);
-    let key = crate::gpu::shader::fnv64(format!("{console:?} {shaders}").as_bytes());
-    if !SEEN.lock().unwrap().get_or_insert_with(HashSet::new).insert(key) {
-        return;
+    let title: Vec<u32> = r.subs.iter().map(|(s, _)| s.ty).collect();
+    let pc: Vec<u32> = r.subs.iter().map(|(_, pc)| *pc).collect();
+    let shaders = shader_hashes(buf, r);
+    let line = format!("MS {:016x} ({}): types {title:?} read as the PC's {pc:?} (shaders {shaders})", ms_hash(buf), r.reading);
+    if first_time(&SEEN, &line) {
+        crate::xlog_info!("D3D12.X: console-numbered pipeline stream, {line}");
     }
-    crate::xlog_info!("D3D12.X: console-numbered pipeline stream, MS {ms:016x}: types {console:?} read as the PC's {pc:?} (shaders {shaders})");
+}
+
+/// One line per stream with a console MS container in type 24 that is left as it is.
+unsafe fn note_kept(buf: &[u8], why: &str) {
+    static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+    let line = format!("MS {:016x} in type 24 left as it is: {why}; types {:?}", ms_hash(buf), types_of(&walk_pc(buf)));
+    if first_time(&SEEN, &line) {
+        crate::xlog_warn!("D3D12.X: pipeline stream {line}");
+    }
 }
 
 fn walk_summary(w: &Walk, size: usize) -> String {
@@ -216,10 +289,10 @@ fn walk_summary(w: &Walk, size: usize) -> String {
 unsafe fn kind(buf: &[u8], pc: &Walk) -> &'static str {
     let shader = |ty: u32| pc.subs.iter().find(|s| s.ty == ty).and_then(|s| bytecode(&buf[s.payload.clone()]));
     let stage = |ty: u32| shader(ty).and_then(console_stage);
-    if stage(24).is_some_and(|s| s == "MS") && shader(25).is_none() {
+    if stage(24).is_some_and(|s| s == "MS") && shader(PC_MS).is_none() {
         "MS in the AS slot"
-    } else if shader(25).is_some() {
-        if stage(25).is_some() { "console mesh" } else { "PC mesh" }
+    } else if shader(PC_MS).is_some() {
+        if stage(PC_MS).is_some() { "console mesh" } else { "PC mesh" }
     } else if shader(1).is_some() {
         if stage(1).is_some() { "console graphics" } else { "PC graphics" }
     } else if shader(6).is_some() {
@@ -230,47 +303,50 @@ unsafe fn kind(buf: &[u8], pc: &Walk) -> &'static str {
 }
 
 /// A subobject as the trace shows it: offset, type, payload size, then a shader's stage, size
-/// and hash, a few state values, or the payload's hash.
+/// and hash, a few state values, any 4-byte payload's value, or the payload's hash.
 unsafe fn describe(buf: &[u8], s: &Sub, pc_ty: Option<u32>) -> String {
     let p = &buf[s.payload.clone()];
     let head = format!("{:#x}:{}({})", s.off, s.ty, p.len());
     let word = |k: usize| p.get(4 * k..4 * k + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
     match pc_ty {
-        Some(t) if (1..=6).contains(&t) || t == 24 || t == 25 => match bytecode(p) {
+        Some(t) if is_shader_type(t) => match bytecode(p) {
             Some(c) => format!("{head} {} {}B {:016x}", console_stage(c).unwrap_or_else(|| "pc".into()), c.len(), crate::gpu::shader::fnv64(c)),
             None => format!("{head} null"),
         },
-        Some(14) => format!("{head} topology {}", word(0)),
         Some(15) => format!("{head} rt {} {:?}", word(8), (0..8).map(word).collect::<Vec<_>>()),
-        Some(16) => format!("{head} ds {}", word(0)),
         Some(17) => format!("{head} samples {}/{}", word(0), word(1)),
         Some(t) if POINTER_PAYLOADS.contains(&t) => format!("{head} {}", if p.iter().any(|&b| b != 0) { "ptr" } else { "zero" }),
+        _ if p.len() == 4 => format!("{head} ={:#x}", word(0)),
         _ => format!("{head} {:016x}", crate::gpu::shader::fnv64(p)),
     }
 }
 
 /// `XCL_TRACE_PSO_STREAM`: one line per distinct stream (no shader bytes).
-unsafe fn trace(buf: &[u8], console: Option<&Walk>) {
+unsafe fn trace(buf: &[u8], plan: &Plan) {
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
     let pc = walk_pc(buf);
     let cw = walk_console(buf);
-    let (reading, w, numbering): (&str, &Walk, fn(u32) -> Option<u32>) = match console {
-        Some(w) => ("console", w, console_to_pc),
-        None if pc.stop.is_none() => ("pc", &pc, Some),
-        None => ("console", &cw, console_to_pc),
+    let subs: Vec<String> = match plan {
+        Plan::Remap(r) => r.subs.iter().map(|(s, t)| describe(buf, s, Some(*t))).collect(),
+        _ if pc.stop.is_none() => pc.subs.iter().map(|s| describe(buf, s, Some(s.ty))).collect(),
+        _ => cw.subs.iter().map(|s| describe(buf, s, console_to_pc(s.ty))).collect(),
     };
-    let subs = w.subs.iter().map(|s| describe(buf, s, numbering(s.ty))).collect::<Vec<_>>().join(", ");
+    let reading = match plan {
+        Plan::Remap(r) => r.reading,
+        _ if pc.stop.is_none() => "pc",
+        _ => "console",
+    };
     let line = format!(
-        "{} B [{}], PC walk {}, console walk {}; read as {reading}: {subs}",
+        "{} B [{}], PC walk {}, console walk {}; read as {reading}: {}",
         buf.len(),
         kind(buf, &pc),
         walk_summary(&pc, buf.len()),
-        walk_summary(&cw, buf.len())
+        walk_summary(&cw, buf.len()),
+        subs.join(", ")
     );
-    if !SEEN.lock().unwrap().get_or_insert_with(HashSet::new).insert(crate::gpu::shader::fnv64(line.as_bytes())) {
-        return;
+    if first_time(&SEEN, &line) {
+        crate::xlog_info!("D3D12.X: PSO stream {line}");
     }
-    crate::xlog_info!("D3D12.X: PSO stream {line}");
 }
 
 #[cfg(test)]
@@ -320,7 +396,6 @@ mod tests {
     const RENDER_TARGET_FORMATS: u32 = 15;
     const DEPTH_STENCIL_FORMAT: u32 = 16;
     const PC_AS: u32 = 24;
-    const PC_MS: u32 = 25;
     const RS_POINTER: u64 = 0x1234_5678_9abc_def0;
     const R8G8B8A8_UNORM: u32 = 28;
     const D32_FLOAT: u32 = 40;
@@ -351,28 +426,43 @@ mod tests {
         &buf[w.subs.iter().find(|s| s.ty == ty).unwrap().payload.clone()]
     }
 
+    fn remap(buf: &[u8]) -> Remap {
+        match plan(buf, is_ms) {
+            Plan::Remap(r) => r,
+            other => panic!("not remapped: {other:?}"),
+        }
+    }
+
+    fn left_alone(buf: &[u8]) -> bool {
+        matches!(plan(buf, is_ms), Plan::Pc)
+    }
+
+    fn kept(buf: &[u8]) -> bool {
+        matches!(plan(buf, is_ms), Plan::Kept(_))
+    }
+
     #[test]
     fn console_stream_reads_as_the_pcs() {
         let (ms, ps) = (container(KIND_MS, NGG_MS), container(KIND_PS, PS_PS));
         let console = stream(CONSOLE_MS, &ms, &ps);
-        let w = console_numbered(&console, is_ms).expect("the MS container in type 24 and nothing the console numbering does not know");
-        let pc = to_pc(&console, &w);
-        let r = walk_pc(&pc);
-        assert_eq!(r.stop, None);
-        assert_eq!(r.end, pc.len());
-        assert_eq!(types_of(&r), vec![ROOT_SIGNATURE, PC_MS, PS, BLEND, RASTERIZER, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT]);
-        assert!(!r.subs.iter().any(|s| s.ty == PC_AS));
-        let code = |ty| unsafe { bytecode(payload_of(&pc, &r, ty)) }.unwrap();
+        let r = remap(&console);
+        assert_eq!(r.reading, "console");
+        let pc = to_pc(&console, &r);
+        let w = walk_pc(&pc);
+        assert_eq!(w.stop, None);
+        assert_eq!(w.end, pc.len());
+        assert_eq!(types_of(&w), vec![ROOT_SIGNATURE, PC_MS, PS, BLEND, RASTERIZER, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT]);
+        let code = |ty| unsafe { bytecode(payload_of(&pc, &w, ty)) }.unwrap();
         assert_eq!(code(PC_MS), &ms[..]);
         assert_eq!(code(PS), &ps[..]);
         assert_eq!(console_stage(code(PC_MS)).as_deref(), Some("MS"));
         assert_eq!(console_stage(code(PS)).as_deref(), Some("PS"));
-        assert_eq!(payload_of(&pc, &r, ROOT_SIGNATURE), RS_POINTER.to_le_bytes());
-        assert_eq!(payload_of(&pc, &r, RENDER_TARGET_FORMATS), &rt_formats()[..]);
-        assert_eq!(payload_of(&pc, &r, DEPTH_STENCIL_FORMAT), D32_FLOAT.to_le_bytes());
+        assert_eq!(payload_of(&pc, &w, ROOT_SIGNATURE), RS_POINTER.to_le_bytes());
+        assert_eq!(payload_of(&pc, &w, RENDER_TARGET_FORMATS), &rt_formats()[..]);
+        assert_eq!(payload_of(&pc, &w, DEPTH_STENCIL_FORMAT), D32_FLOAT.to_le_bytes());
         assert_eq!(pc.len(), console.len());
         let changed: Vec<usize> = (0..pc.len()).filter(|&i| pc[i] != console[i]).collect();
-        let ms_off = w.subs.iter().find(|s| s.ty == CONSOLE_MS).unwrap().off;
+        let ms_off = r.subs.iter().find(|(s, _)| s.ty == CONSOLE_MS).unwrap().0.off;
         assert_eq!(changed, vec![ms_off], "only the MS subobject's type changes (24 → 25)");
     }
 
@@ -382,16 +472,46 @@ mod tests {
         let mut s = Stream(stream(CONSOLE_MS, &ms, &ps));
         s.shader(23, &amp);
         assert_eq!(walk_pc(&s.0).stop.map(|x| x.1), Some(23), "the PC's numbering has no 23");
-        let w = console_numbered(&s.0, is_ms).expect("console-numbered");
-        let r = walk_pc(&to_pc(&s.0, &w));
-        assert_eq!(r.stop, None);
-        assert_eq!(types_of(&r), vec![ROOT_SIGNATURE, PC_MS, PS, BLEND, RASTERIZER, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT, PC_AS]);
+        let r = remap(&s.0);
+        assert_eq!(r.reading, "console");
+        let w = walk_pc(&to_pc(&s.0, &r));
+        assert_eq!(w.stop, None);
+        assert_eq!(types_of(&w), vec![ROOT_SIGNATURE, PC_MS, PS, BLEND, RASTERIZER, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT, PC_AS]);
+    }
+
+    #[test]
+    fn console_ms_with_types_from_26_on_moves_only_the_ms() {
+        const DEPTH_STENCIL2: u32 = 26;
+        const RASTERIZER1: u32 = 27;
+        const RASTERIZER2: u32 = 28;
+        let (ms, ps) = (container(KIND_MS, NGG_MS), container(KIND_PS, PS_PS));
+        let mut s = Stream(stream(CONSOLE_MS, &ms, &ps));
+        s.raw(DEPTH_STENCIL2, &[0; 60], false).raw(RASTERIZER1, &[0; 44], false).raw(RASTERIZER2, &[0; 40], false);
+        assert!(walk_console(&s.0).stop.is_some(), "the console table does not know 25 and up");
+        let r = remap(&s.0);
+        assert_eq!(r.reading, "MS only");
+        let pc = to_pc(&s.0, &r);
+        let w = walk_pc(&pc);
+        assert_eq!(w.stop, None);
+        assert_eq!(
+            types_of(&w),
+            vec![ROOT_SIGNATURE, PC_MS, PS, BLEND, RASTERIZER, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT, DEPTH_STENCIL2, RASTERIZER1, RASTERIZER2]
+        );
+        assert_eq!(unsafe { bytecode(payload_of(&pc, &w, PC_MS)) }.unwrap(), &ms[..]);
+    }
+
+    #[test]
+    fn console_ms_with_a_null_25_is_kept() {
+        let (ms, ps) = (container(KIND_MS, NGG_MS), container(KIND_PS, PS_PS));
+        let mut s = Stream(stream(CONSOLE_MS, &ms, &ps));
+        s.raw(PC_MS, &[0; 16], true);
+        assert!(kept(&s.0));
     }
 
     #[test]
     fn pc_mesh_stream_is_left_alone() {
         let (ms, ps) = (container(KIND_MS, NGG_MS), container(KIND_PS, PS_PS));
-        assert!(console_numbered(&stream(PC_MS, &ms, &ps), is_ms).is_none(), "a PC MS (25) is not the console's numbering");
+        assert!(left_alone(&stream(PC_MS, &ms, &ps)), "a PC MS (25) is not the console's numbering");
     }
 
     #[test]
@@ -399,24 +519,22 @@ mod tests {
         let (amp, ms, ps) = (container(KIND_AS, NGG_MS), container(KIND_MS, NGG_MS), container(KIND_PS, PS_PS));
         let mut s = Stream(stream(PC_MS, &ms, &ps));
         s.shader(PC_AS, &amp);
-        assert!(console_numbered(&s.0, is_ms).is_none());
+        assert!(left_alone(&s.0));
     }
 
     #[test]
     fn non_mesh_container_in_24_is_left_alone() {
         let (amp, ps) = (container(KIND_AS, NGG_MS), container(KIND_PS, PS_PS));
-        assert!(console_numbered(&stream(PC_AS, &amp, &ps), is_ms).is_none(), "an AS container in 24 is the PC's AS");
-        assert!(console_numbered(&stream(PC_AS, &[0x44; 64], &ps), is_ms).is_none(), "a PC blob in 24 is the PC's AS");
+        assert!(left_alone(&stream(PC_AS, &amp, &ps)), "an AS container in 24 is the PC's AS");
+        assert!(left_alone(&stream(PC_AS, &[0x44; 64], &ps)), "a PC blob in 24 is the PC's AS");
     }
 
     #[test]
-    fn console_types_from_25_on_are_unknown() {
-        let (ms, ps) = (container(KIND_MS, NGG_MS), container(KIND_PS, PS_PS));
-        let mut s = Stream(stream(CONSOLE_MS, &ms, &ps));
-        s.raw(26, &[0; 60], false);
-        assert!(console_numbered(&s.0, is_ms).is_none());
+    fn console_table_knows_0_to_24() {
         assert_eq!((25..40).filter_map(console_to_pc).count(), 0);
         assert!((0..23).all(|t| console_to_pc(t) == Some(t)));
+        assert_eq!(console_to_pc(23), Some(PC_AS));
+        assert_eq!(console_to_pc(24), Some(PC_MS));
     }
 
     #[test]
@@ -434,5 +552,24 @@ mod tests {
         let w = walk_pc(&s.0);
         assert_eq!(w.stop, Some((8, 99)));
         assert_eq!(types_of(&w), vec![DEPTH_STENCIL_FORMAT]);
+    }
+
+    fn prepared(buf: &[u8], trace: bool, remap: bool) -> Option<Vec<u8>> {
+        let desc: [usize; 2] = [buf.len(), buf.as_ptr() as usize];
+        unsafe { prepare_with(desc.as_ptr() as *const c_void, trace, remap) }.map(|s| {
+            let d = s.desc() as *const usize;
+            unsafe { std::slice::from_raw_parts(*d.add(1) as *const u8, *d).to_vec() }
+        })
+    }
+
+    #[test]
+    fn prepare_rewrites_only_with_the_flag() {
+        let (ms, ps) = (container(KIND_MS, NGG_MS), container(KIND_PS, PS_PS));
+        let console = stream(CONSOLE_MS, &ms, &ps);
+        assert!(prepared(&console, false, false).is_none());
+        assert!(prepared(&console, true, false).is_none(), "the trace alone changes nothing");
+        let pc = prepared(&console, false, true).expect("rewritten");
+        assert_eq!(types_of(&walk_pc(&pc)), vec![ROOT_SIGNATURE, PC_MS, PS, BLEND, RASTERIZER, RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT]);
+        assert!(prepared(&stream(PC_MS, &ms, &ps), true, true).is_none(), "a PC stream is passed as it is");
     }
 }
