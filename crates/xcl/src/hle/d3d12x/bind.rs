@@ -17,6 +17,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::console_list::{self, Layout, Param};
+use super::wait_trace::{SkipKind, SkipWhy};
 
 #[derive(Default)]
 struct State {
@@ -67,6 +68,22 @@ fn count(k: usize) {
 
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
+}
+
+/// `XCL_WAIT_TRACE`: a draw or dispatch on `list` was skipped – with the bound pipeline and the
+/// address arguments of the root signature it uses (the graphics one for a draw).
+fn trace_skip(list: *mut c_void, kind: SkipKind, why: SkipWhy) {
+    if !super::wait_trace::on() {
+        return;
+    }
+    let (pso, roots) = with(list, |s| {
+        let (layout, args) = match kind {
+            SkipKind::Draw => (s.layout_gfx.as_deref(), &s.args_gfx),
+            SkipKind::Dispatch => (s.layout.as_deref(), &s.args),
+        };
+        (s.pso, super::wait_trace::roots(layout, args))
+    });
+    super::wait_trace::note_skip(list, kind, why, pso, roots);
 }
 
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
@@ -253,7 +270,7 @@ fn signature_dispatches(sig: usize) -> bool {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let (pso, unbuilt) = super::pso_async::resolve_wait_checked(with(this, |s| s.pso));
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
@@ -262,7 +279,18 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(with(this, |s| s.pso)) {
+        // (also when the frame's pipeline wait budget ran out: `XCL_PSO_FRAME_WAIT_MS`; the
+        // build may have ended since, and the stand-in must not reach the PC call)
+        if unbuilt || super::pso_async::is_pending(with(this, |s| s.pso)) {
+            if unbuilt {
+                if signature_dispatches(sig) {
+                    super::pso_async::note_skipped_dispatch();
+                } else {
+                    super::pso_async::note_skipped_draw();
+                }
+            }
+            let why = if unbuilt { SkipWhy::Budget } else { SkipWhy::Building };
+            trace_skip(this, if signature_dispatches(sig) { SkipKind::Dispatch } else { SkipKind::Draw }, why);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -275,6 +303,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
         // A native PC compute pipeline is not one of these and still goes to the PC call.
         if signature_dispatches(sig) && super::real::is_console_compute(pso) {
+            trace_skip(this, SkipKind::Dispatch, SkipWhy::Untranslated);
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -496,7 +525,16 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    let (resolved, unbuilt) = super::pso_async::resolve_wait_checked(pso);
+    // the frame's pipeline wait budget ran out before it was built (`XCL_PSO_FRAME_WAIT_MS`):
+    // skipped, not drawn with the stand-in
+    if unbuilt {
+        count(DRAWS_SKIPPED);
+        super::pso_async::note_skipped_draw();
+        trace_skip(this, SkipKind::Draw, SkipWhy::Budget);
+        return None;
+    }
+    if !super::real::is_translated_graphics(resolved) {
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
@@ -801,9 +839,14 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let (pso, unbuilt) = super::pso_async::resolve_wait_checked(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
+        // (the frame's pipeline wait budget ran out before it was built: `XCL_PSO_FRAME_WAIT_MS`)
+        if unbuilt {
+            super::pso_async::note_skipped_dispatch();
+        }
+        trace_skip(this, SkipKind::Dispatch, if unbuilt { SkipWhy::Budget } else { SkipWhy::Untranslated });
         // a console pipeline without a translation (including a background build that
         // failed): nothing to run (its root arguments were not given to the PC list either)
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

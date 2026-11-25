@@ -818,8 +818,17 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // a pipeline still being built in the background is waited for; if
                         // the background translation failed, skip instead of binding XCL's
                         // ABI root signature onto the stand-in
-                        let real = super::pso_async::resolve_wait((*p).pc);
+                        let (real, unbuilt) = super::pso_async::resolve_wait_checked((*p).pc);
                         if !super::real::is_translated_compute(real) {
+                            // (the frame's pipeline wait budget ran out: `XCL_PSO_FRAME_WAIT_MS`)
+                            if unbuilt {
+                                super::pso_async::note_skipped_dispatch();
+                            }
+                            if super::wait_trace::on() {
+                                use super::wait_trace::{SkipKind, SkipWhy};
+                                let why = if unbuilt { SkipWhy::Budget } else { SkipWhy::Untranslated };
+                                super::wait_trace::note_skip(obj as *mut c_void, SkipKind::Dispatch, why, (*p).pc, super::wait_trace::roots(layout.as_deref(), &table));
+                            }
                             out.skipped_dispatches += 1;
                             continue;
                         }

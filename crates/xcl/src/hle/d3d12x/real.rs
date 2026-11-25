@@ -1181,9 +1181,10 @@ static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 
 /// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
 /// stride = element size, num_records in elements); empty when the buffer is not in UMA.
-fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
+fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool, cause: super::empty_views::Cause, slot: u32) -> [u32; 4] {
     let Some((at, bytes)) = console_buffer(res) else {
         note_buffer_view();
+        super::empty_views::note(cause, || empty_buffer_view(res, format, n, stride, raw, slot));
         return [0; 4];
     };
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
@@ -1831,6 +1832,35 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
     Some(p)
 }
 
+/// `empty_views::Sample` of a buffer view that is not in unified memory.
+fn empty_buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, n: u32, stride: u32, raw: bool, slot: u32) -> super::empty_views::Sample {
+    const RAW_ELEMENT_BYTES: u64 = 4;
+    let element = if raw {
+        RAW_ELEMENT_BYTES
+    } else if stride > 0 {
+        stride as u64
+    } else {
+        crate::gpu::desc::gfx10_format(format).map_or(RAW_ELEMENT_BYTES, |f| crate::gpu::desc::format_bytes(f).max(1) as u64)
+    };
+    let d = unsafe { ID3D12Resource::from_raw_borrowed(&(res as *mut c_void)).map(|r| r.GetDesc()) };
+    super::empty_views::Sample {
+        res,
+        va: title_address(res).map_or(0, |a| a as u64),
+        bytes: n as u64 * element,
+        flags: d.map_or(0, |d| d.Flags.0 as u32),
+        format: format.0 as u32,
+        dimension: D3D12_RESOURCE_DIMENSION_BUFFER.0,
+        slot,
+    }
+}
+
+/// `empty_views::Sample` of a texture view whose shape is not known (`view_shape`).
+fn empty_texture_view(res: usize, d: &D3D12_RESOURCE_DESC, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, dimension: i32, slot: u32) -> super::empty_views::Sample {
+    let format = if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { d.Format } else { format };
+    let va = title_address(res).or_else(|| super::title_textures::address(res)).map_or(0, |a| a as u64);
+    super::empty_views::Sample { res, va, bytes: super::empty_views::texture_bytes(d, format), flags: d.Flags.0 as u32, format: format.0 as u32, dimension, slot }
+}
+
 fn note_buffer_view() {
     if NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::xlog_warn!("buffer view in the console heap: the buffer is not in UMA – the shader gets an empty V# (num_records 0)");
@@ -1849,6 +1879,7 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
     if !in_uma {
         note_buffer_view();
+        super::empty_views::note(super::empty_views::Cause::CbvNotInUma, || super::empty_views::Sample { va, bytes: size as u64, slot: slot.index, ..Default::default() });
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
@@ -2080,6 +2111,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: CreateShaderResourceView(RAYTRACING_ACCELERATION_STRUCTURE) at {va:#x} is not in unified memory – writing empty BVH descriptor");
         }
+        super::empty_views::note(super::empty_views::Cause::BvhNotInUma, || super::empty_views::Sample { va, dimension: v.ViewDimension.0, slot: slot.index, ..Default::default() });
         return super::console_heap::write(&slot, &[0; 8]);
     }
     // translated shaders declare every cube T# as a TextureCubeArray: a title's TEXTURECUBE
@@ -2101,12 +2133,13 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
     }
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
+        super::empty_views::note(super::empty_views::Cause::SrvNoResource, || super::empty_views::Sample { dimension: desc.as_ref().map_or(0, |v| v.ViewDimension.0), slot: slot.index, ..Default::default() });
         return super::console_heap::write(&slot, &[0; 8]);
     };
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, super::empty_views::Cause::SrvBufferNotInUma, slot.index));
     }
     let (format, dim, array, mips) = match desc.as_ref() {
         Some(v) => {
@@ -2133,6 +2166,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         Some((fmt, ty, w, h, d, m)) => super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, m)),
         None => {
             note_buffer_view();
+            super::empty_views::note(super::empty_views::Cause::SrvShapeUnknown, || empty_texture_view(res as usize, &r.GetDesc(), format, dim, slot.index));
             super::console_heap::write(&slot, &[0; 8]);
         }
     }
@@ -2277,13 +2311,14 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
+        super::empty_views::note(super::empty_views::Cause::UavNoResource, || super::empty_views::Sample { dimension: desc.as_ref().map_or(0, |v| v.ViewDimension.0), slot: slot.index, ..Default::default() });
         return super::console_heap::write(&slot, &[0; 8]);
     };
     let rd = r.GetDesc();
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw, super::empty_views::Cause::UavBufferNotInUma, slot.index));
     }
     // UAV dimensions: 1 buffer, 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
     let (format, dim, array, mip) = match desc.as_ref() {
@@ -2303,6 +2338,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     };
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
         note_buffer_view();
+        super::empty_views::note(super::empty_views::Cause::UavShapeUnknown, || empty_texture_view(res as usize, &rd, format, dim, slot.index));
         return super::console_heap::write(&slot, &[0; 8]);
     };
     // RDNA images have no SRV / UAV distinction: console shaders may read this slot too
@@ -2517,7 +2553,12 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
-        Kind::Fence => v.push(("Signal", fence_signal as usize)),
+        Kind::Fence => {
+            v.push(("Signal", fence_signal as usize));
+            if super::wait_trace::on() {
+                v.push(("SetEventOnCompletion", fence_set_event_on_completion as usize));
+            }
+        }
         _ => {}
     }
     v
@@ -4350,11 +4391,21 @@ mod shaders_key_tests {
 
 impl OwnedDesc {
     fn shaders_key(&self) -> u64 {
-        shaders_key(match self {
+        shaders_key(self.blobs())
+    }
+
+    /// each shader's record hash (`fnv64` of its container, as "driver compile start … record"
+    /// and `[SHADER]` lines give it) – `XCL_WAIT_TRACE`
+    fn record_hashes(&self) -> Vec<u64> {
+        self.blobs().iter().map(|b| crate::gpu::shader::fnv64(b)).collect()
+    }
+
+    fn blobs(&self) -> &[Vec<u8>] {
+        match self {
             OwnedDesc::Compute(_, b) => b,
             OwnedDesc::Graphics(_, b, ..) => b,
             OwnedDesc::Stream(_, _, b) => b,
-        })
+        }
     }
 
     fn ptr(&self) -> *const c_void {
@@ -4499,6 +4550,9 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    if super::wait_trace::on() {
+        super::wait_trace::note_records(*ppv as usize, owned.record_hashes());
+    }
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
@@ -5480,7 +5534,7 @@ pub(super) fn note_newer_device_method(slot: usize) {
 }
 
 /// Whether `p` is a fence the title created.
-fn is_fence(p: usize) -> bool {
+pub(super) fn is_fence(p: usize) -> bool {
     p != 0 && FENCES.read().unwrap_or_else(|e| e.into_inner()).contains(&p)
 }
 
@@ -5530,6 +5584,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                 } else {
                     super::fence_x::note_queue_wait(a1, a2 as u64);
                     super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
+                }
+                if super::wait_trace::on() {
+                    super::wait_trace::note_title_fence_op(this as usize, a1, older == 14);
                 }
             }
             hr as u32 as usize
@@ -5621,8 +5678,19 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
+        if super::wait_trace::on() {
+            super::wait_trace::note_title_fence_op(this as usize, fence as usize, true);
+        }
     }
     hr
+}
+
+/// Fence::SetEventOnCompletion, hooked only with `XCL_WAIT_TRACE`: the title's own event waits
+/// (its threads wait on the event in the system, out of XCL's sight)
+unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
+    super::wait_trace::note_set_event(this, value, event as usize);
+    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
+    f(this, value, event)
 }
 
 /// Fence::Signal (CPU)
@@ -5654,6 +5722,9 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    if super::wait_trace::on() {
+        super::wait_trace::submitted(this, std::slice::from_raw_parts(lists, n as usize), &mapped);
+    }
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
         super::list_x::copy_scratch_submitted(this, chunk);

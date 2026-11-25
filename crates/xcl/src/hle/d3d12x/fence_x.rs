@@ -111,6 +111,33 @@ pub(super) fn pending_summary() -> String {
     }
 }
 
+/// A title fence as `XCL_WAIT_TRACE` lists it.
+pub(super) struct FenceSnapshot {
+    pub fence: usize,
+    pub done: u64,
+    pub signalled: u64,
+    pub waited: u64,
+    /// the title asked for its completed value's address (and reads / sleeps on it)
+    pub cell: bool,
+}
+
+/// Every title fence a queue signalled or waited for that `alive` holds a reference to, with its
+/// completed value now.
+pub(super) fn snapshot(alive: impl Fn(usize) -> bool) -> Vec<FenceSnapshot> {
+    let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter()
+        .flatten()
+        .filter(|(&p, _)| alive(p))
+        .map(|(&p, f)| FenceSnapshot {
+            fence: p,
+            done: unsafe { borrowed(p, |f| f.GetCompletedValue()) }.unwrap_or(0),
+            signalled: f.signalled,
+            waited: f.waited,
+            cell: f.cell.is_some(),
+        })
+        .collect()
+}
+
 /// fence #12: the address of its completed value
 pub(super) unsafe extern "system" fn completed_value_address(this: *mut c_void) -> *const u64 {
     let (cell, pending) = {

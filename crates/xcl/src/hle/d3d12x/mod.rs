@@ -15,6 +15,7 @@ pub mod console_heap;
 pub mod console_list;
 pub mod device_x;
 pub mod dxgi_device;
+pub mod empty_views;
 mod cpu_writes;
 mod fence_x;
 pub mod frame;
@@ -32,6 +33,7 @@ pub mod sparse;
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;
+pub mod wait_trace;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -82,6 +84,8 @@ pub fn backend() -> Backend {
         match real::init() {
             Ok(desc) => {
                 crate::xlog_info!("D3D12.X: backend 'real' – {desc}");
+                pso_async::check_frame_budget();
+                wait_trace::on();
                 Backend::Real
             }
             Err(e) => {

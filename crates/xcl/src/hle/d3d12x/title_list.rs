@@ -150,6 +150,27 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     hr
 }
 
+/// The wrapper recording into `pc` when `pc` is one of its split segments rather than its
+/// primary list (a Reset that reaches such a segment must reset the whole recording).
+pub(super) fn split_owner(pc: *mut c_void) -> Option<*mut c_void> {
+    let wrapper = wrapper_of(pc)?;
+    let primary = unsafe { *((wrapper as usize + F_PRIMARY) as *const *mut c_void) };
+    (primary != pc).then_some(wrapper)
+}
+
+/// The wrapper's own Reset (#10) for a Reset that reached one of its segments.
+pub(super) unsafe fn reset_wrapper(wrapper: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
+    reset(wrapper, alloc, pso)
+}
+
+/// Whether `wrapper` may split once more and still keep `reserve` segments for later splits.
+pub(super) fn can_split_reserving(wrapper: *mut c_void, reserve: usize) -> bool {
+    let sg = SEGMENTS.lock().unwrap();
+    sg.as_ref()
+        .and_then(|m| m.get(&(wrapper as usize)))
+        .is_none_or(|b| b.extra_active.len() + reserve < MAX_EXTRA_SEGMENTS)
+}
+
 /// #10 Reset(allocator, initial_pso): resets the primary PC list (`F_PRIMARY`) via `list_x::reset_x`
 /// (calling directly rather than through the dual-dispatch vtable thunk so console state always
 /// resets even though this wrapper sits in `xcl.exe`), restores `F_BACKING = F_PRIMARY`, and moves
@@ -250,6 +271,11 @@ pub(super) fn wrapper_of(pc: *mut c_void) -> Option<*mut c_void> {
 
 pub(super) unsafe fn has_recorded_work(wrapper: *mut c_void) -> bool {
     *((wrapper as usize + F_RECORDED_WORK) as *const u8) != 0
+}
+
+#[cfg(test)]
+pub(super) unsafe fn mark_recorded_work(wrapper: *mut c_void) {
+    *((wrapper as usize + F_RECORDED_WORK) as *mut u8) = 1;
 }
 
 pub(super) unsafe fn clear_recorded_work(pc: *mut c_void) {
