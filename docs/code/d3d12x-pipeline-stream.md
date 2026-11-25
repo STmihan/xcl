@@ -138,13 +138,13 @@ minimap pipelines.
   D3D12.X: XCL_CONSOLE_STREAM_TYPES=0: pipeline streams in the console's subobject numbering are passed as they are
   ```
 
-  Why it is on by default: VIctory, a fork of this emulator, has always read console types 23 and
-  24 as AS and MS, and all of the title's world mesh shaders translate there. The numbering is
+  Why it is on by default: the VIctory project has always read console types 23 and 24 as AS and
+  MS, and all of the title's world mesh shaders translate there. The numbering is
   still inferred, not measured (the table above).
 
 ## What the next run should check
 
-- Set both variables. Do the `[MS in the AS slot]` lines say `PC walk ok to <size>` (the walk ends
+- With `XCL_TRACE_PSO_STREAM=1`: do the `[MS in the AS slot]` lines say `PC walk ok to <size>` (the walk ends
   exactly at `SizeInBytes`)? Their RT / DS formats and topology should be plausible for a minimap
   pass. Which types do they hold, and is any of them 26–28?
 - Is there any line whose PC walk `stops at … on type 23` or on a type ≥ 26?
