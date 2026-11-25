@@ -2555,7 +2555,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
         Kind::Fence => {
             v.push(("Signal", fence_signal as usize));
-            if super::wait_trace::on() {
+            if super::wait_trace::on() || super::list_x::bridge_unsubmitted() {
                 v.push(("SetEventOnCompletion", fence_set_event_on_completion as usize));
             }
         }
@@ -5689,10 +5689,15 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     hr
 }
 
-/// Fence::SetEventOnCompletion, hooked only with `XCL_WAIT_TRACE`: the title's own event waits
-/// (its threads wait on the event in the system, out of XCL's sight)
+/// Fence::SetEventOnCompletion, hooked only with `XCL_WAIT_TRACE` or `XCL_BRIDGE_UNSUBMITTED=1`:
+/// the title's own event waits (its threads wait on the event in the system, out of XCL's sight)
 unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
-    super::wait_trace::note_set_event(this, value, event as usize);
+    if super::wait_trace::on() {
+        super::wait_trace::note_set_event(this, value, event as usize);
+    }
+    if super::list_x::bridge_unsubmitted() {
+        super::list_x::note_title_event_wait(this, value);
+    }
     let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
     f(this, value, event)
 }

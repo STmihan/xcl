@@ -120,6 +120,93 @@ fn bridge_split() -> BridgeSplit {
     })
 }
 
+const BRIDGE_UNSUBMITTED_VAR: &str = "XCL_BRIDGE_UNSUBMITTED";
+/// How long the title must have waited on the CPU for a title fence, and the GPU wait holding
+/// that fence back must have been armed, before `XCL_BRIDGE_UNSUBMITTED=1` releases the wait:
+/// long enough for another title thread to submit the producing list, far below the watchdog.
+const TITLE_HELD_RELEASE_AFTER: Duration = Duration::from_millis(100);
+/// Title CPU waits (`SetEventOnCompletion`) kept for the title-held release: more are a leak.
+const MAX_TITLE_EVENT_WAITS: usize = 1024;
+
+fn parse_bridge_unsubmitted(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!("{BRIDGE_UNSUBMITTED_VAR}={other:?} must be unset, 0 or 1")),
+    }
+}
+
+#[cfg(test)]
+static FORCE_BRIDGE_UNSUBMITTED: AtomicBool = AtomicBool::new(false);
+
+/// `XCL_BRIDGE_UNSUBMITTED=1`: a GPU wait whose Write64 is recorded but not submitted is released
+/// on the CPU as soon as the title waits on the CPU for a title fence that the waiting queue
+/// signals after that wait (the title holds the producer back until the waiter is done), instead
+/// of after the watchdog's 5 s.
+pub(super) fn bridge_unsubmitted() -> bool {
+    #[cfg(test)]
+    if FORCE_BRIDGE_UNSUBMITTED.load(Ordering::Acquire) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match parse_bridge_unsubmitted(std::env::var(BRIDGE_UNSUBMITTED_VAR).ok().as_deref()) {
+            Ok(on) => on,
+            Err(e) => {
+                crate::xlog_error!("D3D12.X: {e}");
+                panic!("D3D12.X: {e}");
+            }
+        };
+        crate::xlog_info!("D3D12.X: Write64/Wait64 bridge releases title-held unsubmitted producers: {on} ({BRIDGE_UNSUBMITTED_VAR})");
+        on
+    })
+}
+
+/// Why a bridged cell's fence was signalled on the CPU instead of by its producer's queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CpuRelease {
+    /// the producer's GPU signal would have closed a cycle of queue waits
+    CycleBreak,
+    /// a GPU wait on it outlived `gpu_wait_watchdog_timeout`
+    Watchdog,
+    /// `XCL_BRIDGE_UNSUBMITTED=1`: its producer was not submitted while the title waited on the
+    /// CPU for work queued after the GPU wait
+    TitleHeld,
+}
+
+/// A title `ID3D12Fence::SetEventOnCompletion(value)` not yet reached: the title waits for it on
+/// the CPU (its event), and submits nothing that thread would submit until then.
+struct TitleEventWait {
+    fence: ID3D12Fence,
+    value: u64,
+    since: Instant,
+}
+
+// SAFETY: `ID3D12Fence` is free-threaded.
+unsafe impl Send for TitleEventWait {}
+
+static TITLE_EVENT_WAITS: Mutex<Vec<TitleEventWait>> = Mutex::new(Vec::new());
+
+/// The title asked `fence` (one of its own) to set an event at `value`: with
+/// `XCL_BRIDGE_UNSUBMITTED=1` the watchdog checks whether a bridged GPU wait holds it back.
+pub(super) unsafe fn note_title_event_wait(fence: *mut c_void, value: u64) {
+    let Some(f) = ID3D12Fence::from_raw_borrowed(&fence) else { return };
+    if f.GetCompletedValue() >= value {
+        return;
+    }
+    {
+        let mut g = TITLE_EVENT_WAITS.lock().unwrap();
+        g.retain(|w| w.fence.GetCompletedValue() < w.value);
+        if g.len() >= MAX_TITLE_EVENT_WAITS {
+            g.remove(0);
+        }
+        g.push(TitleEventWait { fence: f.clone(), value, since: Instant::now() });
+    }
+    if ARMED_GPU_WAITS.load(Ordering::Acquire) > 0 {
+        wake_sync_watchdog();
+    }
+}
+
 fn wait_timeout() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
     *T.get_or_init(|| {
@@ -1134,6 +1221,8 @@ struct SyncCell {
     /// Set once a `Wait64BitValueX` on this cell was bridged to a GPU `queue.Wait`: a cell
     /// another queue waits for, whose writes `XCL_BRIDGE_SPLIT=1` splits after.
     bridged: bool,
+    /// Why the fence was last signalled on the CPU (None: never).
+    cpu_release: Option<CpuRelease>,
 }
 
 // SAFETY: `ID3D12Fence` is a free-threaded COM object in D3D12.
@@ -1474,6 +1563,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         for (va, val) in break_cells {
             if let Some(cell) = graph.cells.get_mut(&va) {
                 cell.cpu_signaled_max = cell.cpu_signaled_max.max(val);
+                cell.cpu_release = Some(CpuRelease::CycleBreak);
                 let before = cell.armed_waits.len();
                 cell.armed_waits.retain(|aw| aw.val > val);
                 let removed = before - cell.armed_waits.len();
@@ -1500,6 +1590,99 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
     }
 }
 
+/// A bridged GPU wait released on the CPU because the title holds its producer back.
+struct TitleHeldRelease {
+    va: u64,
+    val: u64,
+    fence: ID3D12Fence,
+    waiter: usize,
+    title_fence: usize,
+    title_value: u64,
+    recorded: u64,
+    submitted: u64,
+}
+
+/// `XCL_BRIDGE_UNSUBMITTED=1`: the GPU waits that hold back a title fence the title waits for on
+/// the CPU while their own Write64 is recorded but not submitted. The title submits that
+/// Write64 only after its CPU wait (run37: q3 waits for q0's cell, the title waits for q3's
+/// fence, q0's list with the write follows), so the producer can never arrive first and only
+/// the watchdog, 5 s later, would let the waiter go on: release them now, as the watchdog would.
+///
+/// A wait counts when it was armed on the queue that signals the fence (the first title Signal
+/// that reaches the value the title waits for) before that Signal, and both the CPU wait and
+/// the GPU wait are older than `TITLE_HELD_RELEASE_AFTER` – time for another title thread to
+/// submit the producer instead.
+unsafe fn take_title_held(graph: &mut SyncGraph) -> Vec<TitleHeldRelease> {
+    let held: Vec<(usize, u64, usize, u64)> = {
+        let mut waits = TITLE_EVENT_WAITS.lock().unwrap();
+        waits.retain(|w| w.fence.GetCompletedValue() < w.value);
+        let mut out = Vec::new();
+        for w in waits.iter().filter(|w| w.since.elapsed() >= TITLE_HELD_RELEASE_AFTER) {
+            let raw = w.fence.as_raw() as usize;
+            let Some(tf) = graph.title_fences.get_mut(&raw) else { continue };
+            prune_title_fence(raw, tf);
+            if let Some(s) = tf.signals.iter().filter(|s| s.val >= w.value).min_by_key(|s| s.val) {
+                out.push((s.queue, s.seq, raw, w.value));
+            }
+        }
+        out
+    };
+    if held.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (&va, cell) in graph.cells.iter_mut() {
+        if cell.armed_waits.is_empty() {
+            continue;
+        }
+        let completed = prune_completed_waits(cell);
+        if completed == u64::MAX {
+            continue;
+        }
+        let mut release: Option<(u64, usize, usize, u64)> = None;
+        for aw in &cell.armed_waits {
+            if aw.val <= cell.submitted_max || aw.val <= cell.cpu_signaled_max || aw.armed_at.elapsed() < TITLE_HELD_RELEASE_AFTER {
+                continue;
+            }
+            let Some(&(_, _, tf, tv)) = held.iter().find(|&&(q, seq, _, _)| q == aw.waiting_queue && aw.wait_seq < seq) else { continue };
+            if release.is_none_or(|(v, ..)| aw.val > v) {
+                release = Some((aw.val, aw.waiting_queue, tf, tv));
+            }
+        }
+        let Some((val, waiter, title_fence, title_value)) = release else { continue };
+        let Some(fence) = cell.fence.clone() else { continue };
+        cell.cpu_signaled_max = cell.cpu_signaled_max.max(val);
+        cell.cpu_release = Some(CpuRelease::TitleHeld);
+        let before = cell.armed_waits.len();
+        cell.armed_waits.retain(|aw| aw.val > val);
+        let removed = before - cell.armed_waits.len();
+        if removed > 0 {
+            ARMED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
+        }
+        cell.submitted_signals.retain(|s| s.val > val);
+        out.push(TitleHeldRelease { va, val, fence, waiter, title_fence, title_value, recorded: cell.recorded_max, submitted: cell.submitted_max });
+    }
+    out
+}
+
+fn log_title_held(r: &TitleHeldRelease) {
+    const DETAILED: u64 = 32;
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= DETAILED || n.is_power_of_two() {
+        crate::xlog_warn!(
+            "D3D12.X: GPU queue.Wait at {:#x} >= {:#x} on q{} holds title fence {:#x} >= {:#x} that the title waits for on the CPU, and its Write64 is recorded ({:#x}) but not submitted ({:#x}) – released on CPU (title-held release #{n}, {BRIDGE_UNSUBMITTED_VAR})",
+            r.va,
+            r.val,
+            queue_id(r.waiter),
+            r.title_fence,
+            r.title_value,
+            r.recorded,
+            r.submitted
+        );
+    }
+}
+
 fn wake_sync_watchdog() {
     let pair = SYNC_WATCHDOG_WAKE.get_or_init(|| {
         let pair = (Mutex::new(()), Condvar::new());
@@ -1511,7 +1694,7 @@ fn wake_sync_watchdog() {
                 continue;
             }
             let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
-            let (expired, rewinds) = {
+            let (expired, rewinds, held) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
                 let mut rew: Vec<(ID3D12Fence, u64)> = Vec::new();
@@ -1555,6 +1738,7 @@ fn wake_sync_watchdog() {
                         }
                         if max_exp > 0 {
                             cell.cpu_signaled_max = cell.cpu_signaled_max.max(max_exp);
+                            cell.cpu_release = Some(CpuRelease::Watchdog);
                             cell.submitted_signals.retain(|s| s.val > max_exp);
                             if let Some(ref f) = cell.fence {
                                 out.push((
@@ -1573,12 +1757,22 @@ fn wake_sync_watchdog() {
                         }
                     }
                 }
-                (out, rew)
+                let held = match g.as_mut() {
+                    Some(graph) if bridge_unsubmitted() => unsafe { take_title_held(graph) },
+                    _ => Vec::new(),
+                };
+                (out, rew, held)
             };
             for (fence, val) in rewinds {
                 unsafe {
                     let _ = fence.Signal(val);
                 }
+            }
+            for r in &held {
+                unsafe {
+                    let _ = r.fence.Signal(r.val);
+                }
+                log_title_held(r);
             }
             let had_expired = !expired.is_empty();
             for (va, val, fence, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in expired {
@@ -1756,6 +1950,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                         cell.submitted_max = val;
                         cell.submitted_queue = None;
                         cell.cpu_signaled_max = cell.cpu_signaled_max.max(val);
+                        cell.cpu_release = Some(CpuRelease::CycleBreak);
                         if val > cell.recorded_max {
                             cell.recorded_max = val;
                         }
@@ -7019,6 +7214,163 @@ mod tests {
             assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
+        }
+    }
+
+    #[test]
+    fn bridge_unsubmitted_mode_parses_unset_zero_and_one_and_rejects_others() {
+        assert_eq!(parse_bridge_unsubmitted(None), Ok(false));
+        assert_eq!(parse_bridge_unsubmitted(Some("")), Ok(false));
+        assert_eq!(parse_bridge_unsubmitted(Some("0")), Ok(false));
+        assert_eq!(parse_bridge_unsubmitted(Some(" 1 ")), Ok(true));
+        assert!(parse_bridge_unsubmitted(Some("yes")).is_err());
+    }
+
+    /// A device for the two-queue bridge tests (WARP when there is no GPU), None: skip.
+    unsafe fn bridge_test_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() {
+            return dev;
+        }
+        let factory = CreateDXGIFactory1::<IDXGIFactory4>().ok()?;
+        let warp = factory.EnumWarpAdapter::<IDXGIAdapter>().ok()?;
+        D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
+        dev
+    }
+
+    /// One title list on `queue` as `q_execute_command_lists` submits it (bridge waits first,
+    /// Write64 signals after).
+    unsafe fn bridge_test_submit(queue: &ID3D12CommandQueue, list: &ID3D12GraphicsCommandList) {
+        let raw = list.as_raw();
+        let cl: ID3D12CommandList = list.cast().unwrap();
+        execute_with_waits_on(queue.as_raw(), &[raw], |chunk| {
+            queue.ExecuteCommandLists(&[Some(cl.clone())]);
+            signal_write64_fences(queue.as_raw(), chunk);
+        });
+    }
+
+    /// A title `queue.Signal(fence, value)` as `queue_dispatch` passes it on.
+    unsafe fn bridge_test_title_signal(queue: &ID3D12CommandQueue, fence: &ID3D12Fence, value: u64) {
+        break_cycles_before_title_signal(queue.as_raw() as usize, fence.as_raw() as usize, value);
+        queue.Signal(fence, value).unwrap();
+        note_title_queue_signal(queue.as_raw() as usize, fence.as_raw() as usize, value);
+    }
+
+    /// The pattern run37 stalls on, which the bridge could only end with the watchdog (5 s):
+    /// q0 (direct) records `Write64(X, V)` in a list the title submits only once it has seen
+    /// q1's title fence on the CPU, and q1 (compute) waits `X >= V` before that fence's Signal.
+    /// With `XCL_BRIDGE_UNSUBMITTED=1` the wait is released as soon as the title waits (a
+    /// title-held release: not a cycle break, not the watchdog), the title goes on and submits
+    /// q0's list, whose signal then has nothing left to do.
+    #[test]
+    fn a_title_held_unsubmitted_producer_is_released_long_before_the_watchdog() {
+        unsafe {
+            let Some(dev) = bridge_test_device() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            FORCE_BRIDGE_UNSUBMITTED.store(true, Ordering::Release);
+            const V: u64 = 0x682;
+            let q0: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let q1: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let a0: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let a1: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let producer: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a0, None).unwrap();
+            let waiter: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a1, None).unwrap();
+            let q1_done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let q0_done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            on_create(producer.as_raw(), a0.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            on_create(waiter.as_raw(), a1.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            let cell = Box::new(AtomicU64::new(V - 1));
+            let va = &*cell as *const AtomicU64 as u64;
+
+            note_write64_recorded(producer.as_raw(), va, V);
+            producer.Close().unwrap();
+            wait64_x(waiter.as_raw(), va, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, V, 1, 0);
+            waiter.Close().unwrap();
+
+            let t0 = Instant::now();
+            bridge_test_submit(&q1, &waiter);
+            bridge_test_title_signal(&q1, &q1_done, 1);
+            note_title_event_wait(q1_done.as_raw(), 1);
+            crate::gpu::fence::wait(&q1_done, 1, &dev, None, 2000).expect("the title's CPU wait on q1 must end without the producer");
+            let waited = t0.elapsed();
+            assert!(waited < gpu_wait_watchdog_timeout() / 2, "released after {} ms: the watchdog, not the title-held release", waited.as_millis());
+
+            bridge_test_submit(&q0, &producer);
+            q0.Signal(&q0_done, 1).unwrap();
+            crate::gpu::fence::wait(&q0_done, 1, &dev, None, 2000).expect("q0 must finish its list");
+
+            {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.as_mut().unwrap();
+                let c = gr.cells.get(&va).unwrap();
+                assert_eq!(c.cpu_release, Some(CpuRelease::TitleHeld), "neither a cycle break nor the watchdog");
+                assert_eq!(c.cpu_signaled_max, V);
+                assert!(c.armed_waits.is_empty());
+                gr.cells.remove(&va);
+                gr.title_fences.remove(&(q1_done.as_raw() as usize));
+            }
+            on_release(producer.as_raw() as usize);
+            on_release(waiter.as_raw() as usize);
+        }
+    }
+
+    /// The same two lists when the title fence is signalled before the waiting list (the shape
+    /// that does not deadlock on the console either): nothing is released on the CPU, and the
+    /// waiter's later work runs only after q0's Write64.
+    #[test]
+    fn a_title_fence_signalled_before_the_waiting_list_releases_nothing() {
+        unsafe {
+            let Some(dev) = bridge_test_device() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            FORCE_BRIDGE_UNSUBMITTED.store(true, Ordering::Release);
+            const V: u64 = 0x683;
+            let q0: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let q1: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let a0: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let a1: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let producer: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a0, None).unwrap();
+            let waiter: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a1, None).unwrap();
+            let title_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let q1_done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            on_create(producer.as_raw(), a0.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            on_create(waiter.as_raw(), a1.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            let cell = Box::new(AtomicU64::new(V - 1));
+            let va = &*cell as *const AtomicU64 as u64;
+
+            note_write64_recorded(producer.as_raw(), va, V);
+            producer.Close().unwrap();
+            wait64_x(waiter.as_raw(), va, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, V, 1, 0);
+            waiter.Close().unwrap();
+
+            bridge_test_title_signal(&q1, &title_fence, 1);
+            bridge_test_submit(&q1, &waiter);
+            q1.Signal(&q1_done, 1).unwrap();
+            note_title_event_wait(title_fence.as_raw(), 1);
+            crate::gpu::fence::wait(&title_fence, 1, &dev, None, 2000).expect("the title fence comes before the wait");
+            std::thread::sleep(TITLE_HELD_RELEASE_AFTER * 3);
+            assert_eq!(q1_done.GetCompletedValue(), 0, "q1's work after the wait must not run before q0's Write64");
+
+            bridge_test_submit(&q0, &producer);
+            crate::gpu::fence::wait(&q1_done, 1, &dev, None, 2000).expect("q1 must run once q0's Write64 is signalled");
+
+            {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.as_mut().unwrap();
+                let c = gr.cells.get(&va).unwrap();
+                assert_eq!(c.cpu_release, None, "nothing released on the CPU");
+                assert_eq!(c.cpu_signaled_max, 0);
+                assert_eq!(c.submitted_max, V);
+                gr.cells.remove(&va);
+                gr.title_fences.remove(&(title_fence.as_raw() as usize));
+            }
+            on_release(producer.as_raw() as usize);
+            on_release(waiter.as_raw() as usize);
         }
     }
 }
