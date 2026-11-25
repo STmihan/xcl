@@ -128,27 +128,47 @@ const TITLE_HELD_RELEASE_AFTER: Duration = Duration::from_millis(100);
 /// Title CPU waits (`SetEventOnCompletion`) kept for the title-held release: more are a leak.
 const MAX_TITLE_EVENT_WAITS: usize = 1024;
 
-fn parse_bridge_unsubmitted(value: Option<&str>) -> Result<bool, String> {
+/// What the bridge does with a wait whose Write64 is recorded but not submitted
+/// (`XCL_BRIDGE_UNSUBMITTED`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeUnsubmitted {
+    /// unset or `0`: a GPU `queue.Wait`, released only by the cycle detector or the watchdog
+    Off,
+    /// `1`: a GPU `queue.Wait`, released on the CPU once the title is seen to hold the producer
+    /// back behind it (`take_title_held`)
+    TitleHeld,
+    /// `now`: an experiment (VIctory runs this way): no wait at all – the waiter goes on at once and
+    /// may read the previous value, as with a release on the CPU
+    ReleaseNow,
+}
+
+fn parse_bridge_unsubmitted(value: Option<&str>) -> Result<BridgeUnsubmitted, String> {
     match value.map(str::trim) {
-        None | Some("") | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(other) => Err(format!("{BRIDGE_UNSUBMITTED_VAR}={other:?} must be unset, 0 or 1")),
+        None | Some("") | Some("0") => Ok(BridgeUnsubmitted::Off),
+        Some("1") => Ok(BridgeUnsubmitted::TitleHeld),
+        Some("now") => Ok(BridgeUnsubmitted::ReleaseNow),
+        Some(other) => Err(format!("{BRIDGE_UNSUBMITTED_VAR}={other:?} must be unset, 0, 1 or now")),
     }
 }
 
 #[cfg(test)]
 static FORCE_BRIDGE_UNSUBMITTED: AtomicBool = AtomicBool::new(false);
 
+/// Whether the title's CPU waits on its fences are followed (`XCL_BRIDGE_UNSUBMITTED=1`).
+pub(super) fn bridge_unsubmitted() -> bool {
+    bridge_unsubmitted_mode() == BridgeUnsubmitted::TitleHeld
+}
+
 /// `XCL_BRIDGE_UNSUBMITTED=1`: a GPU wait whose Write64 is recorded but not submitted is released
 /// on the CPU as soon as the title waits on the CPU for a title fence that the waiting queue
 /// signals after that wait (the title holds the producer back until the waiter is done), instead
-/// of after the watchdog's 5 s.
-pub(super) fn bridge_unsubmitted() -> bool {
+/// of after the watchdog's 5 s. `now`: such a wait is not made at all.
+fn bridge_unsubmitted_mode() -> BridgeUnsubmitted {
     #[cfg(test)]
     if FORCE_BRIDGE_UNSUBMITTED.load(Ordering::Acquire) {
-        return true;
+        return BridgeUnsubmitted::TitleHeld;
     }
-    static ON: OnceLock<bool> = OnceLock::new();
+    static ON: OnceLock<BridgeUnsubmitted> = OnceLock::new();
     *ON.get_or_init(|| {
         let on = match parse_bridge_unsubmitted(std::env::var(BRIDGE_UNSUBMITTED_VAR).ok().as_deref()) {
             Ok(on) => on,
@@ -157,7 +177,7 @@ pub(super) fn bridge_unsubmitted() -> bool {
                 panic!("D3D12.X: {e}");
             }
         };
-        crate::xlog_info!("D3D12.X: Write64/Wait64 bridge releases title-held unsubmitted producers: {on} ({BRIDGE_UNSUBMITTED_VAR})");
+        crate::xlog_info!("D3D12.X: Write64/Wait64 bridge, waits on a Write64 not yet submitted: {on:?} ({BRIDGE_UNSUBMITTED_VAR})");
         on
     })
 }
@@ -2105,6 +2125,21 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
             );
         }
         return GpuWaitOutcome::CycleSkip;
+    }
+
+    if sub_max < w.value && bridge_unsubmitted_mode() == BridgeUnsubmitted::ReleaseNow {
+        static RELEASED_NOW: AtomicU64 = AtomicU64::new(0);
+        let n = RELEASED_NOW.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_warn!(
+                "D3D12.X: Wait64BitValueX at {:#x} >= {:#x} on q{}/ty{}: its Write64 is recorded ({rec_max:#x}) but not submitted ({sub_max:#x}) – not waited for (release-now #{n}, {BRIDGE_UNSUBMITTED_VAR}=now)",
+                w.va,
+                w.value,
+                queue_id(q_raw),
+                q_ty.0
+            );
+        }
+        return GpuWaitOutcome::Handled;
     }
 
     let Some(fence) = ensure_cell_fence(w.va, &dev, dev_raw) else { return GpuWaitOutcome::FallbackCpu };
@@ -7221,10 +7256,11 @@ mod tests {
 
     #[test]
     fn bridge_unsubmitted_mode_parses_unset_zero_and_one_and_rejects_others() {
-        assert_eq!(parse_bridge_unsubmitted(None), Ok(false));
-        assert_eq!(parse_bridge_unsubmitted(Some("")), Ok(false));
-        assert_eq!(parse_bridge_unsubmitted(Some("0")), Ok(false));
-        assert_eq!(parse_bridge_unsubmitted(Some(" 1 ")), Ok(true));
+        assert_eq!(parse_bridge_unsubmitted(None), Ok(BridgeUnsubmitted::Off));
+        assert_eq!(parse_bridge_unsubmitted(Some("")), Ok(BridgeUnsubmitted::Off));
+        assert_eq!(parse_bridge_unsubmitted(Some("0")), Ok(BridgeUnsubmitted::Off));
+        assert_eq!(parse_bridge_unsubmitted(Some(" 1 ")), Ok(BridgeUnsubmitted::TitleHeld));
+        assert_eq!(parse_bridge_unsubmitted(Some("now")), Ok(BridgeUnsubmitted::ReleaseNow));
         assert!(parse_bridge_unsubmitted(Some("yes")).is_err());
     }
 
