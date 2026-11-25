@@ -5194,6 +5194,10 @@ unsafe fn put<T>(to: &mut T, from: &[u8]) {
 }
 
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    // XCL_CONSOLE_STREAM_TYPES: a stream in the console's subobject numbering is read and
+    // created as its PC-numbered copy (stream_types.rs); XCL_TRACE_PSO_STREAM logs its layout
+    let pc_numbered = super::stream_types::prepare(desc);
+    let desc = pc_numbered.as_ref().map_or(desc, |s| s.desc());
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
